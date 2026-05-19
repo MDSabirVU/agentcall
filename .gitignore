@@ -7,3 +7,7 @@ __pycache__/
 node_modules/
 .DS_Store
 .env
+
+# Local meeting-moderator artefacts and Claude Code state
+meeting-moderator-log-*.md
+.claude/

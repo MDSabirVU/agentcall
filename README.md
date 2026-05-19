@@ -103,7 +103,7 @@ Works with any agent that can spawn a subprocess and read stdout:
 ## Documentation
 
 - **[SKILL.md](SKILL.md)** — Complete reference (modes, events, commands, patterns, Claude Code integration)
-- **[examples/](examples/)** — 7 working examples (notetakers, support agent, meeting assistants, coding companion)
+- **[examples/](examples/)** — 8 working examples (notetakers, support agent, meeting assistants, coding companion, [meeting-moderator](examples/meeting-moderator/) — a Gemini STT→LLM→TTS round-trip)
 - **[references/](references/)** — API reference + guides (collaborative mode, interruption handling, crash recovery, screenshare)
 
 ## Pricing

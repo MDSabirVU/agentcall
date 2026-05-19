@@ -1,0 +1,26 @@
+# Meeting Moderator v2 — Python dependencies.
+#
+# Install once into the repo venv with:
+#   source .venv/Scripts/activate   (Windows / Git Bash)
+#   pip install -r examples/meeting-moderator-v2/requirements.txt
+#
+# Versions are floored, not pinned, so security patches still flow in. Bump the
+# floor when an SDK breaks for us (e.g. google-genai had a renamed import path
+# pre-1.0; we want to land safely above any of those rough edges).
+
+# AgentCall transport
+requests>=2.31
+websockets>=12.0
+
+# Gemini LLM (the unified SDK; do NOT install the deprecated google-generativeai)
+google-genai>=1.0
+
+# Env loading
+python-dotenv>=1.0
+
+# Block 1 — Slack action-item delivery
+slack-sdk>=3.27
+
+# Block 3 — team roster YAML (Calendar integration; pulled in early so we don't
+# have to do a second pip install when Block 3 lands).
+PyYAML>=6.0

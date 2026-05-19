@@ -39,13 +39,18 @@ import requests
 import websockets
 from dotenv import load_dotenv
 
-# Load GEMINI_API_KEY from a .env file at the repo root (or the cwd).
-# google-genai picks GEMINI_API_KEY up automatically when genai.Client() runs,
-# so we just need it to be present in os.environ.
+# Load GEMINI_API_KEY (and SLACK_BOT_TOKEN, once configured) from a .env file
+# at the repo root (or the cwd). google-genai picks GEMINI_API_KEY up
+# automatically when genai.Client() runs, so we just need it to be present
+# in os.environ. SLACK_BOT_TOKEN we read explicitly below.
 load_dotenv()
 
 from google import genai
 from google.genai import types
+
+# Slack delivery lives in a sibling module so this file stays focused on the
+# AgentCall <-> Gemini round-trip. Block 1 only uses post_action_items.
+from slack_client import post_action_items
 
 # ----------------------------------------------------------------------------
 # AgentCall API config (mirrors examples/support-agent/agent.py)
@@ -69,6 +74,12 @@ if not API_KEY:
 if not os.environ.get("GEMINI_API_KEY"):
     print("Error: set GEMINI_API_KEY (in env or in a .env file at the repo root)")
     sys.exit(1)
+
+# Slack is optional. If the token isn't set, we just skip the post-call Slack
+# delivery entirely - the rest of the pipeline (transcript markdown, REST
+# cleanup) still works. We only complain if --slack-channel is passed without
+# a token; that's a clear user error and worth catching at startup.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 
 HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
@@ -274,6 +285,82 @@ def end_call(call_id: str) -> None:
         print(f"=> Check https://app.agentcall.dev and end call {call_id} manually.")
 
 
+def _format_transcript_for_extraction(transcript: List[dict]) -> str:
+    """
+    Flatten the rolling transcript list into a plain-text dialogue we can
+    paste into a Gemini prompt.
+
+    We label moderator turns "Moderator" rather than the bot's display name
+    so the LLM doesn't get confused about who's a participant. Lines are
+    one-per-utterance to keep token usage tight.
+    """
+    lines: List[str] = []
+    for turn in transcript:
+        role = turn.get("role", "")
+        text = turn.get("text", "").strip()
+        if not text:
+            continue
+        if role == "participant":
+            speaker = turn.get("speaker") or "Speaker"
+            lines.append(f"{speaker}: {text}")
+        else:
+            lines.append(f"Moderator: {text}")
+    return "\n".join(lines)
+
+
+def extract_action_items(chat, transcript: List[dict]) -> str:
+    """
+    Ask Gemini to distil the conversation into a markdown action-item list.
+
+    Why reuse the same `chat` session instead of a fresh one?
+      - Cheaper: the system prompt is already cached on Gemini's side.
+      - Continuity: the model has just lived through this conversation in
+        its rolling history, so it doesn't need to reconstruct context
+        from the raw transcript alone.
+
+    The prompt is deliberately narrow ("output a markdown bullet list,
+    nothing else") because:
+      1. We're going to pipe the result straight into Slack as `text`. Any
+         surrounding chit-chat ("Sure, here's what I found...") would
+         break the post visually.
+      2. Once Block 2 (structured output) lands, this whole function will
+         be the FALLBACK path - the primary path will be assembling
+         markdown from the state["action_items"] list directly. Keep this
+         function conservative so the fallback stays reliable.
+
+    Failure mode: any exception -> empty string. The caller is expected to
+    treat empty as "no Slack post worth making" and either skip or post a
+    "no items captured" placeholder.
+    """
+    if not transcript:
+        return ""
+    body = _format_transcript_for_extraction(transcript)
+    if not body:
+        return ""
+    prompt = (
+        "Below is the transcript of a meeting you just moderated. Extract "
+        "the action items as a markdown bullet list, one bullet per item, "
+        "in this exact format:\n"
+        "- *Owner*: short description of the task (due date if mentioned)\n\n"
+        "Rules:\n"
+        " - Use Slack mrkdwn, so bold is *single asterisks* not **double**.\n"
+        " - One bullet per action item. Keep each under 25 words.\n"
+        " - If a due date was mentioned, include it; otherwise omit.\n"
+        " - If no action items were discussed, reply with exactly:\n"
+        "   No action items identified.\n"
+        " - Output ONLY the bullet list (or the no-items line). No preamble, "
+        "no closing remarks.\n\n"
+        "Transcript:\n"
+        f"{body}"
+    )
+    try:
+        response = chat.send_message(prompt)
+        return (response.text or "").strip()
+    except Exception as exc:
+        print(f"  [extract error] {exc}")
+        return ""
+
+
 def save_call_log(
     call_id: str,
     transcript: List[dict],
@@ -307,7 +394,13 @@ def save_call_log(
 # Main event loop
 # ----------------------------------------------------------------------------
 
-async def run_moderator(call: dict, voice: str, bot_name: str, output_file: Optional[str]) -> None:
+async def run_moderator(
+    call: dict,
+    voice: str,
+    bot_name: str,
+    output_file: Optional[str],
+    slack_channel: Optional[str] = None,
+) -> None:
     """
     Connect to the call's WebSocket and run the STT -> Gemini -> TTS loop.
 
@@ -462,8 +555,28 @@ async def run_moderator(call: dict, voice: str, bot_name: str, output_file: Opti
 
     save_call_log(call_id, transcript, end_reason, output_file)
 
+    # Block 1 cleanup step: post the action-item summary to Slack. This runs
+    # AFTER the markdown transcript is on disk, so even if Slack fails the
+    # human can still read the log locally. We deliberately leave end_call()
+    # for the caller in main() - keeping network-y cleanup ordered (Slack
+    # then REST delete) lets us see Slack errors before the call goes away.
+    if slack_channel:
+        if not SLACK_BOT_TOKEN:
+            print("  --slack-channel was passed but SLACK_BOT_TOKEN is not set. Skipping Slack post.")
+        elif not transcript:
+            print("  Nothing to post to Slack (transcript empty).")
+        else:
+            summary = extract_action_items(chat, transcript)
+            if not summary:
+                summary = "_No action items captured this call._"
+            header = (
+                f"*Meeting summary — {datetime.now():%Y-%m-%d %H:%M}*\n"
+                f"_Call ID: {call_id}_\n\n"
+            )
+            post_action_items(SLACK_BOT_TOKEN, slack_channel, header + summary)
 
-def run_dry(bot_name: str) -> None:
+
+def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
     """
     Interactive rehearsal mode - no AgentCall call, no WebSocket, no TTS.
 
@@ -481,6 +594,11 @@ def run_dry(bot_name: str) -> None:
 
     chat = build_chat_session()
 
+    # Mirror the live transcript buffer so we can exercise the Slack
+    # extraction path on dry-run too. Cheaper than burning AgentCall credits
+    # every time we tweak the action-item prompt.
+    transcript: List[dict] = []
+
     # Mirror the real flow's opening: the live bot greets on the first
     # participant.joined. Do the same here so prompt-tuning covers the
     # greeting path too.
@@ -490,6 +608,7 @@ def run_dry(bot_name: str) -> None:
     )
     if greeting:
         print(f"[bot] {greeting}\n")
+        transcript.append({"role": "moderator", "text": greeting})
 
     try:
         while True:
@@ -499,13 +618,31 @@ def run_dry(bot_name: str) -> None:
                 break
             if not user_text:
                 break
+            transcript.append({"role": "participant", "speaker": "You", "text": user_text})
             reply = ask_gemini(chat, f"You: {user_text}")
             if not reply:
                 print("[bot] (empty reply)\n")
                 continue
             print(f"[bot] {reply}\n")
+            transcript.append({"role": "moderator", "text": reply})
     except KeyboardInterrupt:
         print()  # newline after ^C
+
+    # Slack-on-dry-run lets us validate the full delivery path without
+    # spending credits. Same code path as run_moderator's post-call step.
+    if slack_channel:
+        if not SLACK_BOT_TOKEN:
+            print("[dry-run] --slack-channel was passed but SLACK_BOT_TOKEN is not set. Skipping Slack post.")
+        elif not transcript:
+            print("[dry-run] Nothing to post to Slack (empty session).")
+        else:
+            summary = extract_action_items(chat, transcript)
+            if not summary:
+                summary = "_No action items captured this call._"
+            header = (
+                f"*[dry-run] Meeting summary — {datetime.now():%Y-%m-%d %H:%M}*\n\n"
+            )
+            post_action_items(SLACK_BOT_TOKEN, slack_channel, header + summary)
 
 
 def main() -> None:
@@ -555,11 +692,29 @@ Examples:
             "the flag entirely to stay in cheap audio-only mode."
         ),
     )
+    parser.add_argument(
+        "--slack-channel",
+        default=None,
+        help=(
+            "Slack channel ID (e.g. C0123ABCD) or name (e.g. "
+            "#moderator-action-items) to post the action-item summary to "
+            "after the call. Requires SLACK_BOT_TOKEN in env / .env. Omit "
+            "to skip Slack entirely."
+        ),
+    )
     args = parser.parse_args()
+
+    # Fail fast if Slack was requested but the token is missing. Catching
+    # this here is much friendlier than letting the call run for 5 minutes,
+    # paying for credits, and *then* discovering the post can't go through.
+    if args.slack_channel and not SLACK_BOT_TOKEN:
+        print("Error: --slack-channel was passed but SLACK_BOT_TOKEN is not set.")
+        print("       Add SLACK_BOT_TOKEN=xoxb-... to .env at the repo root, or unset --slack-channel.")
+        sys.exit(1)
 
     # Dry-run branch: no AgentCall call, no WebSocket, no credits.
     if args.dry_run:
-        run_dry(args.name)
+        run_dry(args.name, slack_channel=args.slack_channel)
         return
 
     # Real run requires a meet URL.
@@ -578,7 +733,13 @@ Examples:
     print(f"Status:       {call['status']}\n")
 
     try:
-        asyncio.run(run_moderator(call, args.voice, args.name, args.output))
+        asyncio.run(run_moderator(
+            call,
+            args.voice,
+            args.name,
+            args.output,
+            slack_channel=args.slack_channel,
+        ))
     except KeyboardInterrupt:
         # Ctrl+C path. Without this, the bot stays in the Meet and keeps
         # burning AgentCall credits. End the call hard via the REST API.

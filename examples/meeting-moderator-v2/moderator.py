@@ -308,57 +308,194 @@ def _format_transcript_for_extraction(transcript: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def extract_action_items(chat, transcript: List[dict]) -> str:
+_EMPTY_SUMMARY = {
+    "agenda": "",
+    "outcome_met": "unknown",
+    "outcome_note": "",
+    "action_items_md": "",
+}
+
+
+def extract_meeting_summary(chat, transcript: List[dict]) -> dict:
     """
-    Ask Gemini to distil the conversation into a markdown action-item list.
+    Ask Gemini, in ONE call, for all four post-call fields the Slack post
+    needs: agenda summary, outcome verdict, outcome note, and action-item
+    markdown.
 
-    Why reuse the same `chat` session instead of a fresh one?
-      - Cheaper: the system prompt is already cached on Gemini's side.
-      - Continuity: the model has just lived through this conversation in
-        its rolling history, so it doesn't need to reconstruct context
-        from the raw transcript alone.
+    Returns a dict with these keys (always present, always strings):
+      agenda          short description of what the meeting was about
+                      ("" if no clear agenda was discussed).
+      outcome_met     "yes" | "no" | "partial" | "unknown".
+      outcome_note    one-sentence explanation of the outcome.
+      action_items_md Slack-mrkdwn bullet list ("" if none).
 
-    The prompt is deliberately narrow ("output a markdown bullet list,
-    nothing else") because:
-      1. We're going to pipe the result straight into Slack as `text`. Any
-         surrounding chit-chat ("Sure, here's what I found...") would
-         break the post visually.
-      2. Once Block 2 (structured output) lands, this whole function will
-         be the FALLBACK path - the primary path will be assembling
-         markdown from the state["action_items"] list directly. Keep this
-         function conservative so the fallback stays reliable.
+    Why one call instead of four?
+      - Cheaper and faster (one round-trip, shared context).
+      - The model sees all four fields together, so an action item that
+        directly drives the outcome verdict can be reasoned about
+        consistently.
+      - One JSON parse, one failure mode.
 
-    Failure mode: any exception -> empty string. The caller is expected to
-    treat empty as "no Slack post worth making" and either skip or post a
-    "no items captured" placeholder.
+    Caveat for the 2026-05-21 demo: until Block 2 lands, the moderator
+    doesn't actively *ask* for an agenda. The `agenda` field here is
+    inferred from whatever participants happened to say ("today we want
+    to discuss X"). When Block 2 lands, the bot will solicit the agenda
+    explicitly and we'll pass it in here as ground truth instead of
+    re-inferring.
+
+    Failure mode: any exception OR a JSON parse failure -> return the
+    _EMPTY_SUMMARY shape so callers can render a placeholder Slack post
+    without crashing the cleanup chain.
     """
     if not transcript:
-        return ""
+        return dict(_EMPTY_SUMMARY)
     body = _format_transcript_for_extraction(transcript)
     if not body:
-        return ""
+        return dict(_EMPTY_SUMMARY)
     prompt = (
-        "Below is the transcript of a meeting you just moderated. Extract "
-        "the action items as a markdown bullet list, one bullet per item, "
-        "in this exact format:\n"
-        "- *Owner*: short description of the task (due date if mentioned)\n\n"
-        "Rules:\n"
-        " - Use Slack mrkdwn, so bold is *single asterisks* not **double**.\n"
-        " - One bullet per action item. Keep each under 25 words.\n"
-        " - If a due date was mentioned, include it; otherwise omit.\n"
-        " - If no action items were discussed, reply with exactly:\n"
-        "   No action items identified.\n"
-        " - Output ONLY the bullet list (or the no-items line). No preamble, "
-        "no closing remarks.\n\n"
+        "Below is the transcript of a meeting you just attended. Analyze it "
+        "and respond with a single JSON object containing EXACTLY these keys "
+        "(no extras, no nested wrapping):\n"
+        " - agenda: a short (max 20 words) description of what the meeting "
+        "was about. Empty string if no clear agenda was discussed.\n"
+        " - outcome_met: one of \"yes\", \"no\", \"partial\", or \"unknown\" "
+        "indicating whether the agenda was achieved.\n"
+        " - outcome_note: a single sentence (max 25 words) justifying the "
+        "outcome_met verdict.\n"
+        " - action_items_md: a Slack-mrkdwn bullet list of action items in "
+        "the EXACT format \"- *Owner*: task (due if mentioned)\" with one "
+        "bullet per item. Empty string if no action items were discussed. "
+        "Use *single asterisks* for bold, NOT **double**.\n\n"
+        "Reply with ONLY the raw JSON object. No preamble, no closing "
+        "remarks, no markdown code fences.\n\n"
         "Transcript:\n"
         f"{body}"
     )
     try:
-        response = chat.send_message(prompt)
-        return (response.text or "").strip()
+        # Override the chat-level config for this one call. Two changes
+        # matter here:
+        #   1) response_mime_type="application/json" puts Gemini into
+        #      JSON mode - it commits to emitting parseable JSON with no
+        #      markdown code fences and no preamble text. This was the
+        #      single biggest reliability fix; without it Gemini
+        #      sometimes wrapped the object in ```json fences or
+        #      prepended "Here is the summary:" prose.
+        #   2) max_output_tokens=2000 (vs the chat's default 400) gives
+        #      enough headroom for a multi-action-item meeting. The
+        #      "unterminated string" error we hit on the first live run
+        #      was a 400-token cap clipping mid-quote in the
+        #      action_items_md field.
+        # We keep the chat session's system_instruction (still cached
+        # server-side) and rolling history (which has the meeting fresh
+        # in context) - we only override these two fields.
+        response = chat.send_message(
+            prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=2000,
+                # Low temperature for structured output - we want
+                # deterministic JSON, not creative paraphrasing.
+                temperature=0.2,
+            ),
+        )
+        raw = (response.text or "").strip()
+        if not raw:
+            print("  [summary extract error] Gemini returned empty response.")
+            return dict(_EMPTY_SUMMARY)
+        data = json.loads(raw)
+        return {
+            "agenda": str(data.get("agenda", "")).strip(),
+            "outcome_met": str(data.get("outcome_met", "unknown")).strip().lower(),
+            "outcome_note": str(data.get("outcome_note", "")).strip(),
+            "action_items_md": str(data.get("action_items_md", "")).strip(),
+        }
+    except json.JSONDecodeError as exc:
+        # Save the raw output so we can diagnose what Gemini emitted.
+        # response.text is only available inside the try, so we re-print
+        # it here from the local `raw` we captured before parsing.
+        print(f"  [summary parse error] {exc}")
+        print(f"  [summary raw output] {raw[:300]!r}{'...' if len(raw) > 300 else ''}")
+        return dict(_EMPTY_SUMMARY)
     except Exception as exc:
-        print(f"  [extract error] {exc}")
-        return ""
+        print(f"  [summary extract error] {exc}")
+        return dict(_EMPTY_SUMMARY)
+
+
+def build_slack_summary(
+    call_id: str,
+    started_at: datetime,
+    ended_at: datetime,
+    bot_name: str,
+    voice: str,
+    end_reason: str,
+    summary: dict,
+    dry_run: bool = False,
+) -> str:
+    """
+    Assemble the Slack mrkdwn post body. Pure function (no I/O) so we can
+    iterate on the format in --dry-run cheaply.
+
+    Slack mrkdwn isn't standard markdown:
+      - bold is *single* asterisks, not **double**.
+      - headings (#, ##) render as plain text - we use *bold* for section
+        headers instead.
+      - bullet lists with "- " work fine.
+
+    Sections (in order, conditionally shown):
+      header (title)
+      Call ID / Duration / Bot / End reason
+      Agenda           (omitted if empty)
+      Action items     (always shown - "no items" placeholder if empty)
+      Outcome reached  (omitted entirely if outcome is unknown AND no note)
+    """
+    duration_sec = max(0.0, (ended_at - started_at).total_seconds())
+    if duration_sec < 60:
+        duration_str = f"~{int(duration_sec)} seconds"
+    else:
+        duration_min = duration_sec / 60.0
+        duration_str = f"~{duration_min:.1f} minutes"
+    start_hm = started_at.strftime("%H:%M")
+    end_hm = ended_at.strftime("%H:%M")
+    date_str = started_at.strftime("%Y-%m-%d")
+
+    title_prefix = "[dry-run] " if dry_run else ""
+    lines: List[str] = [
+        f"*{title_prefix}Meeting Summary — {date_str}*",
+        "",
+        f"*Call ID:* {call_id}",
+        f"*Duration:* {duration_str} ({start_hm} – {end_hm} local)",
+        f"*Bot:* {bot_name} (voice: {voice})",
+        f"*End reason:* {end_reason}",
+        "",
+    ]
+
+    agenda = summary.get("agenda", "").strip()
+    if agenda:
+        lines.append(f"*Agenda:* {agenda}")
+        lines.append("")
+
+    lines.append("*Action items*")
+    action_md = summary.get("action_items_md", "").strip()
+    if action_md:
+        lines.append(action_md)
+    else:
+        lines.append("_No action items captured this call._")
+    lines.append("")
+
+    outcome_met = summary.get("outcome_met", "unknown").strip().lower()
+    outcome_note = summary.get("outcome_note", "").strip()
+    if outcome_met != "unknown" or outcome_note:
+        verdict_label = {
+            "yes": "Yes",
+            "no": "No",
+            "partial": "Partial",
+            "unknown": "Unclear",
+        }.get(outcome_met, "Unclear")
+        lines.append(f"*Outcome reached:* {verdict_label}")
+        if outcome_note:
+            lines.append(outcome_note)
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def save_call_log(
@@ -400,6 +537,7 @@ async def run_moderator(
     bot_name: str,
     output_file: Optional[str],
     slack_channel: Optional[str] = None,
+    state: Optional[dict] = None,
 ) -> None:
     """
     Connect to the call's WebSocket and run the STT -> Gemini -> TTS loop.
@@ -423,8 +561,15 @@ async def run_moderator(
     sep = "&" if "?" in ws_url else "?"
     ws_url = f"{ws_url}{sep}api_key={API_KEY}"
 
-    # Rolling transcript we'll dump to markdown at the end of the call.
-    transcript: List[dict] = []
+    # Share transcript + chat with the caller via a mutable `state` dict.
+    # Why a state dict instead of returning these values?
+    #   - On Ctrl+C, asyncio.run() raises KeyboardInterrupt without giving
+    #     us a return value. main() still needs the transcript + chat to
+    #     save the markdown log and post to Slack. The dict survives the
+    #     exception because main() owns it.
+    if state is None:
+        state = {}
+    transcript: List[dict] = state.setdefault("transcript", [])
     # `is_speaking` defends against the bot's own TTS audio bleeding back
     # into STT. In direct mode, the bot's voice is injected into the Meet's
     # audio bus, so the STT engine can transcribe it. We skip transcript.final
@@ -435,8 +580,11 @@ async def run_moderator(
     end_reason = "unknown"
 
     # Build the Gemini chat session BEFORE connecting so the bot can greet
-    # the moment a human joins without a cold-start delay.
+    # the moment a human joins without a cold-start delay. Store on state so
+    # main() can reuse it for the end-of-call extract_action_items call even
+    # if we get cancelled mid-stream.
     chat = build_chat_session()
+    state["chat"] = chat
 
     # Redact the api_key query param in the printed URL so the key doesn't
     # end up in terminal scrollback / pasted bug reports.
@@ -553,27 +701,83 @@ async def run_moderator(
             end_reason = "ws_closed"
             print("\nWebSocket closed.")
 
+    # Mirror end_reason onto state for main() to pick up. We don't run
+    # save_call_log or post to Slack here anymore - that's main()'s job,
+    # inside a try/finally so Ctrl+C can't skip it. (See finalize_call()
+    # below.)
+    state["end_reason"] = end_reason
+
+
+def finalize_call(
+    call_id: str,
+    state: dict,
+    output_file: Optional[str],
+    slack_channel: Optional[str],
+) -> None:
+    """
+    Run the post-call cleanup: transcript markdown + Slack post.
+
+    Pulled out of run_moderator() so main() can call it from a try/finally
+    block. The KeyboardInterrupt that fires on Ctrl+C propagates out of
+    asyncio.run() and would otherwise skip any code that lived after the
+    WebSocket loop inside run_moderator(). Living in main() means this
+    fires no matter how the call ended: normal exit, ws_closed, or Ctrl+C.
+
+    Idempotent for accidental double-calls (e.g. if the state dict somehow
+    got passed in twice) - we look for a sentinel key and bail.
+
+    state contract (all optional, finalize_call fills in safe defaults):
+      transcript    list[dict]  - rolling transcript
+      chat                       - Gemini chat session
+      end_reason    str          - "call.ended" reason / "ws_closed" / "interrupted"
+      started_at    datetime     - when the call was created (for duration)
+      bot_name      str          - display name (for the Slack header)
+      voice         str          - TTS voice (for the Slack header)
+    """
+    if state.get("_finalized"):
+        return
+    state["_finalized"] = True
+
+    transcript = state.get("transcript") or []
+    chat = state.get("chat")
+    end_reason = state.get("end_reason", "unknown")
+    started_at = state.get("started_at") or datetime.now()
+    ended_at = datetime.now()
+    bot_name = state.get("bot_name", "Moderator")
+    voice = state.get("voice", "unknown")
+
     save_call_log(call_id, transcript, end_reason, output_file)
 
-    # Block 1 cleanup step: post the action-item summary to Slack. This runs
-    # AFTER the markdown transcript is on disk, so even if Slack fails the
-    # human can still read the log locally. We deliberately leave end_call()
-    # for the caller in main() - keeping network-y cleanup ordered (Slack
-    # then REST delete) lets us see Slack errors before the call goes away.
-    if slack_channel:
-        if not SLACK_BOT_TOKEN:
-            print("  --slack-channel was passed but SLACK_BOT_TOKEN is not set. Skipping Slack post.")
-        elif not transcript:
-            print("  Nothing to post to Slack (transcript empty).")
-        else:
-            summary = extract_action_items(chat, transcript)
-            if not summary:
-                summary = "_No action items captured this call._"
-            header = (
-                f"*Meeting summary — {datetime.now():%Y-%m-%d %H:%M}*\n"
-                f"_Call ID: {call_id}_\n\n"
-            )
-            post_action_items(SLACK_BOT_TOKEN, slack_channel, header + summary)
+    if not slack_channel:
+        return
+    if not SLACK_BOT_TOKEN:
+        print("  --slack-channel was passed but SLACK_BOT_TOKEN is not set. Skipping Slack post.")
+        return
+    if not transcript:
+        # Still send a heads-up - it's useful to know a call started and
+        # ended even if nothing was said.
+        body = build_slack_summary(
+            call_id, started_at, ended_at, bot_name, voice, end_reason,
+            dict(_EMPTY_SUMMARY),
+        )
+        post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
+        return
+    if chat is None:
+        # No chat session means run_moderator never got past startup -
+        # nothing to extract from. Still post the header so the channel
+        # sees the call happened.
+        body = build_slack_summary(
+            call_id, started_at, ended_at, bot_name, voice, end_reason,
+            dict(_EMPTY_SUMMARY),
+        )
+        post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
+        return
+
+    summary = extract_meeting_summary(chat, transcript)
+    body = build_slack_summary(
+        call_id, started_at, ended_at, bot_name, voice, end_reason, summary,
+    )
+    post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
 
 
 def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
@@ -598,6 +802,7 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
     # extraction path on dry-run too. Cheaper than burning AgentCall credits
     # every time we tweak the action-item prompt.
     transcript: List[dict] = []
+    started_at = datetime.now()
 
     # Mirror the real flow's opening: the live bot greets on the first
     # participant.joined. Do the same here so prompt-tuning covers the
@@ -628,21 +833,26 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
     except KeyboardInterrupt:
         print()  # newline after ^C
 
-    # Slack-on-dry-run lets us validate the full delivery path without
-    # spending credits. Same code path as run_moderator's post-call step.
+    # Slack-on-dry-run lets us validate the full delivery path - now
+    # exercising the same rich-summary builder the live path uses.
     if slack_channel:
         if not SLACK_BOT_TOKEN:
             print("[dry-run] --slack-channel was passed but SLACK_BOT_TOKEN is not set. Skipping Slack post.")
         elif not transcript:
             print("[dry-run] Nothing to post to Slack (empty session).")
         else:
-            summary = extract_action_items(chat, transcript)
-            if not summary:
-                summary = "_No action items captured this call._"
-            header = (
-                f"*[dry-run] Meeting summary — {datetime.now():%Y-%m-%d %H:%M}*\n\n"
+            summary = extract_meeting_summary(chat, transcript)
+            body = build_slack_summary(
+                call_id="dry-run",
+                started_at=started_at,
+                ended_at=datetime.now(),
+                bot_name=bot_name,
+                voice="(dry-run, no TTS)",
+                end_reason="dry-run",
+                summary=summary,
+                dry_run=True,
             )
-            post_action_items(SLACK_BOT_TOKEN, slack_channel, header + summary)
+            post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
 
 
 def main() -> None:
@@ -732,6 +942,20 @@ Examples:
     print(f"Call created: {call_id}")
     print(f"Status:       {call['status']}\n")
 
+    # `state` is the bridge between run_moderator (which writes to it as the
+    # call progresses) and finalize_call (which reads from it to save the
+    # log + post to Slack). We own it here in main() so even a Ctrl+C-driven
+    # KeyboardInterrupt can't cause us to lose the transcript or skip the
+    # Slack post.
+    #
+    # bot_name / voice / started_at are seeded here so finalize_call can
+    # build a complete Slack header even if run_moderator gets cancelled
+    # before it ever connects to the WebSocket.
+    state: dict = {
+        "bot_name": args.name,
+        "voice": args.voice,
+        "started_at": datetime.now(),
+    }
     try:
         asyncio.run(run_moderator(
             call,
@@ -739,15 +963,22 @@ Examples:
             args.name,
             args.output,
             slack_channel=args.slack_channel,
+            state=state,
         ))
     except KeyboardInterrupt:
-        # Ctrl+C path. Without this, the bot stays in the Meet and keeps
-        # burning AgentCall credits. End the call hard via the REST API.
+        # Ctrl+C path. We still want save_call_log + Slack post to run, so
+        # mark the reason and fall through into the finally block.
         print("\nInterrupted - cleaning up...")
-        end_call(call_id)
-    else:
-        # Normal exit path: call.ended already fired. Still call DELETE in
-        # case anything is lingering server-side - it's idempotent.
+        state["end_reason"] = "interrupted"
+    finally:
+        # ALWAYS runs: normal call.ended exit, ws_closed, Ctrl+C, or any
+        # unhandled exception inside run_moderator. Order matters:
+        #   1) finalize_call — transcript markdown + Slack post (uses chat
+        #      session that's still alive at this point)
+        #   2) end_call — REST DELETE so AgentCall stops billing
+        # Doing Slack first lets us see any Slack failure before the bot
+        # leaves the room.
+        finalize_call(call_id, state, args.output, args.slack_channel)
         end_call(call_id)
 
 

@@ -96,23 +96,141 @@ MODEL = "gemini-2.5-flash"
 # it on every turn. That's the whole point of using a chat session here: the
 # SDK keeps the rolling history for us so we can stay focused on one-shot
 # user-turn -> assistant-turn calls.
+#
+# Block 2 prompt: turns the bot from a "friendly companion" into a
+# MOSTLY-SILENT moderator. Every turn returns a structured JSON object so we
+# can (a) decide whether to actually speak via tts.speak, (b) capture action
+# items deterministically as the meeting unfolds, and (c) detect off-topic
+# drift in real time. The previous chatty behaviour is gone - the bot now
+# speaks only when one of five trigger conditions fires.
 SYSTEM_PROMPT = """
-You are Juno, a friendly conversational companion who has joined a Google
-Meet call. Just chat naturally with whoever is talking - this is a casual
-conversation, not a meeting you need to run.
+You are Juno, a virtual meeting moderator who has joined a video call.
+Your job is to keep the meeting focused, capture action items, draw out
+quiet participants, and rein in dominators. STAY MOSTLY SILENT.
+Listening is your default. Most turns you should output speak: null.
 
-Style rules:
-- Keep replies SHORT - two spoken sentences min and max.
-- Sound warm, curious, and natural.
-- Address people by name when it feels natural.
-- Don't refuse to chat about a topic, and don't try to "keep things on
-  track" - you're not the moderator, you're a participant.
-- Don't say "as an AI" or talk about being a language model.
+Only set "speak" to a non-null value when ONE of these triggers fires:
+
+  1. AGENDA-SETTING: the meeting just started and you don't know the
+     agenda yet. Greet the room warmly with a brief "Hi everyone," (or
+     "Hello!") and then ask what the agenda for the call is. Do this
+     ONCE at the opening, then stay silent until someone answers. Once
+     an agenda has been established, never ask again.
+
+  2. OFF-TOPIC REDIRECT: the conversation has been off-topic from the
+     stated agenda for EIGHT turns in a row, COUNTING ACROSS ALL
+     PARTICIPANTS (look at the "Off-topic streak" number in the per-turn
+     context - it tracks the whole group, not any one speaker). When
+     the streak reaches 8, redirect POLITELY with one short sentence -
+     use words like "please", "sorry to interrupt", "if I may" so it
+     reads as a gentle nudge, not an order. You can address the
+     most-recent drifter by name. Do NOT redirect earlier than eight
+     consecutive off-topic turns - meetings naturally drift and an
+     early intervention feels rude. Single drifts and brief tangents
+     are fine.
+
+     Example good redirects:
+       - "Sorry to interrupt — could we please come back to <agenda>?"
+       - "Bob, if I may, can we steer back toward <agenda>?"
+       - "Just gently flagging - we're a bit off the agenda. Mind if we
+         circle back?"
+
+  3. SILENT-PARTICIPANT NUDGE: a participant has spoken ZERO (0)
+     times AND the total turn count across the OTHER participants is
+     10 or more (i.e. the meeting has had 10+ utterances without them).
+     When both conditions hold, gently and politely invite that
+     person to share their input. Use softening words like "please",
+     "would love to hear", "we'd love your thoughts". Address them by
+     first name. Do this AT MOST ONCE per participant per meeting -
+     check the "Already nudged" list in the context and never re-nudge
+     someone already in it. Don't nudge the bot itself.
+
+     Example good nudges:
+       - "Alice, we'd love to hear your thoughts on this — please
+          jump in whenever."
+       - "Bob, you've been quiet — anything you'd like to add?"
+
+  4. DIRECT ADDRESS: someone calls you by name ("Juno, what do you
+     think?" / "Mod, ..."). Answer briefly and helpfully.
+
+  5. WRAP-UP RECAP: the meeting is winding down. Fire IMMEDIATELY -
+     don't wait for confirmation - on ANY of these signals from any
+     speaker:
+       - "thanks all", "thanks everyone", "thank you all"
+       - "that's everything", "that's it", "that's all"
+       - "let's end here", "let's wrap up", "we're done"
+       - "have a good one", "talk soon", "catch you later"
+       - "bye", "goodbye", "see you"
+     When firing: read back the captured action items in 1-3
+     sentences. If there are NO action items in state, summarize the
+     main discussion points (priorities, decisions, themes) instead -
+     don't stay silent just because no formal action items existed.
+     The recap is the meeting's closing handshake; the audience
+     expects it.
+
+When in doubt: stay silent. speak: null is the right answer for any
+turn where you wouldn't naturally jump into a real meeting as a human
+moderator.
+
+YOU MUST RESPOND IN THIS EXACT JSON SHAPE ON EVERY TURN. No prose,
+no markdown code fences, no preamble - just the raw JSON object:
+
+{
+  "speak": null OR "the words to say out loud (<= 25 words)",
+  "agenda_items": [] OR ["item 1", "item 2"],
+  "new_action_items": [] OR [
+    {"owner": "<name>", "task": "<short description>",
+     "due": null OR "YYYY-MM-DD"}
+  ],
+  "off_topic": false OR true,
+  "follow_up_meeting": null OR {
+    "topic": "<short description>",
+    "attendees": ["<name>", ...]
+  }
+}
+
+Field semantics:
+- speak: the literal words AgentCall TTS will play. Set to null on any
+  turn where no trigger fired. Keep under 25 words.
+- agenda_items: populate ONLY on the turn where the agenda is being
+  established (typically the first substantive turn after you asked).
+  After that, leave it empty - the system already has it.
+- new_action_items: capture every commitment, decision, priority,
+  or concrete task mentioned in THIS turn. Interpret "action item"
+  LIBERALLY - it's not just things explicitly framed as "Alice will
+  do X by Friday". It also includes:
+    * Priorities someone is committing the team to ("we should
+      prioritize feature X first" → owner=speaker, task="prioritize
+      feature X first").
+    * Decisions made in the meeting ("we should retire feature Z"
+      → owner=speaker, task="retire feature Z").
+    * Aspirations someone owns by virtue of having proposed them
+      ("I think a launch webinar is worth doing" → owner=speaker,
+      task="organize launch webinar").
+    * Explicit assignments ("Alice will own the pricing audit by
+      Friday" → owner="Alice", task="pricing audit", due="<friday-iso>").
+  When in doubt: CAPTURE IT. Over-capture is fine; under-capture
+  hurts the meeting summary. Use the speaker's name as owner when
+  no other name is given (treat "we should..." statements as the
+  speaker owning the task by virtue of having raised it).
+  Empty list ONLY if the turn was purely conversational ("hi",
+  "good morning", "interesting") with zero forward-looking content.
+  Use ISO YYYY-MM-DD for due dates when possible. CRITICAL: ALL due
+  dates MUST be in the current year shown in "Today's date" in the
+  per-turn context, OR later. NEVER emit a due date earlier than
+  today. When the speaker says "by Friday", "next week", "end of
+  Q3", "tomorrow" - resolve them using the current calendar year
+  from the context, NOT from any year you remember from training. The per-turn
+  context begins with "Today's date: YYYY-MM-DD" - resolve any
+  relative due dates ("Friday", "end of Q3", "28th of May") against
+  THAT date, not against your training cutoff.
+- off_topic: true if the current utterance is off-topic vs the stated
+  agenda. False (or the agenda is unset) otherwise.
+- follow_up_meeting: populate when someone proposes a follow-up
+  session. Otherwise null.
+
+Never say "as an AI" or talk about being a language model.
 """.strip()
-# To make this bot a moderator instead, replace the prompt above with
-# guidance about agenda-keeping / drawing out silent participants /
-# reining in dominators / capturing action items. The plumbing in this
-# file doesn't change - only the prompt does.
 
 
 # Module-level Gemini client. We keep a strong reference here so its
@@ -145,13 +263,20 @@ def build_chat_session():
         model=MODEL,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            # Headroom for ~3-4 spoken sentences. The prompt itself caps the
-            # bot at two sentences; this budget exists purely so Gemini never
-            # truncates mid-word. Bigger is cheap - flash tokens are fractions
-            # of a cent and an unfinished sentence sounds much worse over TTS
-            # than a slightly longer one.
-            max_output_tokens=400,
-            temperature=0.7,
+            # JSON mode at chat-level. Every turn the moderator emits the
+            # structured object described in SYSTEM_PROMPT. Setting this
+            # once at session creation means we don't have to override
+            # per-call.
+            response_mime_type="application/json",
+            # Bumped from 400 (Block 1 single-sentence reply) to 800 to
+            # fit the full JSON envelope: ~80-120 tokens of fixed fields
+            # plus an arbitrary list of action items. We hit 400 once
+            # already on the summary call - don't repeat that mistake.
+            max_output_tokens=800,
+            # Lower than Block 1's 0.7 because structured output benefits
+            # from less creativity. Still enough headroom for Gemini to
+            # pick varied "speak" phrasings.
+            temperature=0.4,
         ),
     )
     return chat
@@ -180,6 +305,11 @@ def ask_gemini(chat, user_text: str) -> str:
     latest user turn each time. Gemini sometimes returns an empty `.text`
     (safety filter, empty candidate list, etc.); callers must handle "" by
     skipping the tts.speak rather than crashing or sending blank audio.
+
+    NOTE: Block 2 onward, the chat session emits JSON. Use
+    ask_moderator_structured() instead - this raw text helper now exists
+    only for legacy --dry-run prompt-tuning compatibility (Block 1 code
+    paths) and will likely be removed once the new dry-run is stable.
     """
     try:
         response = chat.send_message(user_text)
@@ -189,6 +319,134 @@ def ask_gemini(chat, user_text: str) -> str:
         # return empty so the loop continues listening.
         print(f"  [gemini error] {exc}")
         return ""
+
+
+# Shape returned when ask_moderator_structured() can't parse a response.
+# Mirrors the SYSTEM_PROMPT schema exactly so callers can treat it as a
+# no-op turn without special-casing.
+_EMPTY_TURN = {
+    "speak": None,
+    "agenda_items": [],
+    "new_action_items": [],
+    "off_topic": False,
+    "follow_up_meeting": None,
+}
+
+
+def ask_moderator_structured(chat, prompt: str) -> dict:
+    """
+    Send one enriched turn-context prompt to the moderator chat session and
+    return the parsed JSON object as a dict.
+
+    The chat is configured (in build_chat_session) with
+    response_mime_type="application/json", so Gemini emits valid JSON with
+    no markdown fences and no preamble. We still defend against:
+      - empty response (safety filter etc.) -> _EMPTY_TURN
+      - JSON parse failure -> log + _EMPTY_TURN
+      - missing/wrong-type fields -> coerce or default
+
+    Returns the EXACT _EMPTY_TURN shape on any failure so callers can
+    blindly read response["speak"], response["new_action_items"], etc.
+    without worrying about KeyErrors.
+    """
+    try:
+        response = chat.send_message(prompt)
+        raw = (response.text or "").strip()
+    except Exception as exc:
+        print(f"  [moderator gemini error] {exc}")
+        return dict(_EMPTY_TURN)
+
+    if not raw:
+        # Safety filter or empty candidate - treat as a no-op turn.
+        return dict(_EMPTY_TURN)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # Should be rare now that we're in JSON mode, but if it ever
+        # happens we'd rather skip the turn than crash the call.
+        print(f"  [moderator parse error] {exc}")
+        print(f"  [moderator raw output] {raw[:200]!r}{'...' if len(raw) > 200 else ''}")
+        return dict(_EMPTY_TURN)
+
+    # Coerce each field to the expected type. Gemini is reliable but not
+    # perfect - defensive coercion costs nothing and saves us from "got
+    # None where I expected a list" bugs downstream.
+    speak_raw = data.get("speak")
+    speak = speak_raw.strip() if isinstance(speak_raw, str) and speak_raw.strip() else None
+
+    agenda_items_raw = data.get("agenda_items") or []
+    agenda_items = [str(x).strip() for x in agenda_items_raw if str(x).strip()] if isinstance(agenda_items_raw, list) else []
+
+    new_action_items_raw = data.get("new_action_items") or []
+    new_action_items = []
+    if isinstance(new_action_items_raw, list):
+        for item in new_action_items_raw:
+            if not isinstance(item, dict):
+                continue
+            owner = str(item.get("owner", "")).strip()
+            task = str(item.get("task", "")).strip()
+            if not task:
+                continue  # an action item with no task is useless
+            due_raw = item.get("due")
+            due = str(due_raw).strip() if due_raw and str(due_raw).strip().lower() != "null" else None
+            new_action_items.append({"owner": owner or "Unknown", "task": task, "due": due})
+
+    off_topic = bool(data.get("off_topic", False))
+
+    follow_up_raw = data.get("follow_up_meeting")
+    follow_up = None
+    if isinstance(follow_up_raw, dict):
+        topic = str(follow_up_raw.get("topic", "")).strip()
+        attendees_raw = follow_up_raw.get("attendees") or []
+        attendees = [str(a).strip() for a in attendees_raw if str(a).strip()] if isinstance(attendees_raw, list) else []
+        if topic:
+            follow_up = {"topic": topic, "attendees": attendees}
+
+    return {
+        "speak": speak,
+        "agenda_items": agenda_items,
+        "new_action_items": new_action_items,
+        "off_topic": off_topic,
+        "follow_up_meeting": follow_up,
+    }
+
+
+def merge_turn_into_state(state: dict, turn: dict) -> None:
+    """
+    Merge one structured turn response into the rolling state dict.
+
+    Why merge instead of overwrite?
+      - agenda_items: only the first non-empty list wins. Once an agenda
+        is set, subsequent turns shouldn't be able to replace it (we tell
+        the model this in SYSTEM_PROMPT, but defensive code reinforces).
+      - action_items: cumulative across the whole meeting.
+      - speaker_turns / off_topic_streak: tracked outside this helper by
+        the caller (they need the current speaker name etc.).
+      - follow_up_meeting: last writer wins (latest proposal is what we
+        act on at end-of-call).
+    """
+    if turn.get("agenda_items") and not state.get("agenda"):
+        state["agenda"] = list(turn["agenda_items"])
+
+    new_items = turn.get("new_action_items") or []
+    if new_items:
+        existing = state.setdefault("action_items", [])
+        for item in new_items:
+            # Skip near-duplicates - same owner + same task text (case
+            # insensitive). The model sometimes re-asserts an item it
+            # already mentioned on a previous turn; dedupe so the Slack
+            # post doesn't show the same line twice.
+            dup = any(
+                ex["owner"].lower() == item["owner"].lower()
+                and ex["task"].lower() == item["task"].lower()
+                for ex in existing
+            )
+            if not dup:
+                existing.append(item)
+
+    if turn.get("follow_up_meeting"):
+        state["follow_up"] = turn["follow_up_meeting"]
 
 
 # ----------------------------------------------------------------------------
@@ -316,109 +574,167 @@ _EMPTY_SUMMARY = {
 }
 
 
-def extract_meeting_summary(chat, transcript: List[dict]) -> dict:
+def _format_state_action_items_md(action_items: List[dict]) -> str:
     """
-    Ask Gemini, in ONE call, for all four post-call fields the Slack post
-    needs: agenda summary, outcome verdict, outcome note, and action-item
-    markdown.
+    Format the cumulative action items captured in state into Slack
+    mrkdwn. Preferred over the post-hoc Gemini extraction because the
+    items came directly from per-turn structured responses, so there's no
+    hallucination risk.
 
-    Returns a dict with these keys (always present, always strings):
-      agenda          short description of what the meeting was about
-                      ("" if no clear agenda was discussed).
-      outcome_met     "yes" | "no" | "partial" | "unknown".
-      outcome_note    one-sentence explanation of the outcome.
-      action_items_md Slack-mrkdwn bullet list ("" if none).
-
-    Why one call instead of four?
-      - Cheaper and faster (one round-trip, shared context).
-      - The model sees all four fields together, so an action item that
-        directly drives the outcome verdict can be reasoned about
-        consistently.
-      - One JSON parse, one failure mode.
-
-    Caveat for the 2026-05-21 demo: until Block 2 lands, the moderator
-    doesn't actively *ask* for an agenda. The `agenda` field here is
-    inferred from whatever participants happened to say ("today we want
-    to discuss X"). When Block 2 lands, the bot will solicit the agenda
-    explicitly and we'll pass it in here as ground truth instead of
-    re-inferring.
-
-    Failure mode: any exception OR a JSON parse failure -> return the
-    _EMPTY_SUMMARY shape so callers can render a placeholder Slack post
-    without crashing the cleanup chain.
+    Slack mrkdwn: bold = *single asterisks*, NOT **double**.
     """
+    lines: List[str] = []
+    for item in action_items:
+        owner = item.get("owner") or "Unknown"
+        task = item.get("task") or ""
+        if not task:
+            continue
+        due = item.get("due")
+        if due:
+            lines.append(f"- *{owner}*: {task} (due {due})")
+        else:
+            lines.append(f"- *{owner}*: {task}")
+    return "\n".join(lines)
+
+
+def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None) -> dict:
+    """
+    Build the post-call summary dict the Slack post needs.
+
+    Two sources of truth:
+      1. `state` (preferred). Block 2's moderator emits structured JSON
+         every turn, so by end-of-call we already have agenda + action
+         items tracked deterministically. Use them as ground truth - no
+         hallucination risk, no token cost.
+      2. Gemini one-shot fallback. If state is missing fields (e.g.
+         agenda was never set, or no action items were ever captured),
+         fall back to a single LLM call over the transcript text.
+
+    Always returns the _EMPTY_SUMMARY shape (all four string keys
+    populated, no Nones) so build_slack_summary can format it without
+    None-checks.
+
+    Why a separate one-shot call (not the chat session)?
+      The chat session is configured with the moderator SYSTEM_PROMPT
+      and emits the per-turn schema (speak / agenda_items /
+      new_action_items / off_topic / follow_up). Asking it to emit a
+      *different* JSON schema (agenda/outcome/action_items_md) would
+      collide with its system instructions. We side-step the collision
+      entirely by going direct to generate_content with our own
+      one-shot config.
+    """
+    state = state or {}
+
+    # Build the summary skeleton from state when we can.
+    tracked_agenda: List[str] = list(state.get("agenda") or [])
+    tracked_actions: List[dict] = list(state.get("action_items") or [])
+
+    agenda_str = ", ".join(tracked_agenda) if tracked_agenda else ""
+    action_items_md = _format_state_action_items_md(tracked_actions)
+
+    # outcome_met / outcome_note still need an LLM verdict - we can't
+    # derive "did we cover the agenda?" deterministically from state.
+    # Skip the call only if there's literally nothing to summarize.
     if not transcript:
-        return dict(_EMPTY_SUMMARY)
+        return {
+            "agenda": agenda_str,
+            "outcome_met": "unknown",
+            "outcome_note": "",
+            "action_items_md": action_items_md,
+        }
+
     body = _format_transcript_for_extraction(transcript)
     if not body:
-        return dict(_EMPTY_SUMMARY)
+        return {
+            "agenda": agenda_str,
+            "outcome_met": "unknown",
+            "outcome_note": "",
+            "action_items_md": action_items_md,
+        }
+
+    # Tell the model what we already know so it doesn't re-derive.
+    known_facts = []
+    if agenda_str:
+        known_facts.append(f"The agreed agenda was: {agenda_str}.")
+    if tracked_actions:
+        known_facts.append(
+            f"{len(tracked_actions)} action item(s) were captured during the call."
+        )
+    known_block = ("\n".join(known_facts) + "\n\n") if known_facts else ""
+
     prompt = (
-        "Below is the transcript of a meeting you just attended. Analyze it "
-        "and respond with a single JSON object containing EXACTLY these keys "
-        "(no extras, no nested wrapping):\n"
+        "Below is the transcript of a meeting that just ended. Respond with "
+        "a single JSON object containing EXACTLY these keys (no extras):\n"
         " - agenda: a short (max 20 words) description of what the meeting "
         "was about. Empty string if no clear agenda was discussed.\n"
         " - outcome_met: one of \"yes\", \"no\", \"partial\", or \"unknown\" "
         "indicating whether the agenda was achieved.\n"
         " - outcome_note: a single sentence (max 25 words) justifying the "
         "outcome_met verdict.\n"
-        " - action_items_md: a Slack-mrkdwn bullet list of action items in "
-        "the EXACT format \"- *Owner*: task (due if mentioned)\" with one "
-        "bullet per item. Empty string if no action items were discussed. "
-        "Use *single asterisks* for bold, NOT **double**.\n\n"
+        " - action_items_md: a Slack-mrkdwn bullet list of action items, one "
+        "bullet per item in the EXACT format \"- *Owner*: task (due if "
+        "mentioned)\". Empty string if no action items. Use *single asterisks* "
+        "for bold, NOT **double**.\n\n"
         "Reply with ONLY the raw JSON object. No preamble, no closing "
         "remarks, no markdown code fences.\n\n"
+        f"{known_block}"
         "Transcript:\n"
         f"{body}"
     )
+
+    raw = ""
     try:
-        # Override the chat-level config for this one call. Two changes
-        # matter here:
-        #   1) response_mime_type="application/json" puts Gemini into
-        #      JSON mode - it commits to emitting parseable JSON with no
-        #      markdown code fences and no preamble text. This was the
-        #      single biggest reliability fix; without it Gemini
-        #      sometimes wrapped the object in ```json fences or
-        #      prepended "Here is the summary:" prose.
-        #   2) max_output_tokens=2000 (vs the chat's default 400) gives
-        #      enough headroom for a multi-action-item meeting. The
-        #      "unterminated string" error we hit on the first live run
-        #      was a 400-token cap clipping mid-quote in the
-        #      action_items_md field.
-        # We keep the chat session's system_instruction (still cached
-        # server-side) and rolling history (which has the meeting fresh
-        # in context) - we only override these two fields.
-        response = chat.send_message(
-            prompt,
+        # One-shot call via generate_content - bypasses the chat session
+        # entirely, so the moderator's per-turn JSON schema doesn't
+        # collide with the summary's schema.
+        response = _gemini_client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 max_output_tokens=2000,
-                # Low temperature for structured output - we want
-                # deterministic JSON, not creative paraphrasing.
                 temperature=0.2,
             ),
         )
         raw = (response.text or "").strip()
         if not raw:
             print("  [summary extract error] Gemini returned empty response.")
-            return dict(_EMPTY_SUMMARY)
+            return {
+                "agenda": agenda_str,
+                "outcome_met": "unknown",
+                "outcome_note": "",
+                "action_items_md": action_items_md,
+            }
         data = json.loads(raw)
-        return {
-            "agenda": str(data.get("agenda", "")).strip(),
-            "outcome_met": str(data.get("outcome_met", "unknown")).strip().lower(),
-            "outcome_note": str(data.get("outcome_note", "")).strip(),
-            "action_items_md": str(data.get("action_items_md", "")).strip(),
-        }
     except json.JSONDecodeError as exc:
-        # Save the raw output so we can diagnose what Gemini emitted.
-        # response.text is only available inside the try, so we re-print
-        # it here from the local `raw` we captured before parsing.
         print(f"  [summary parse error] {exc}")
         print(f"  [summary raw output] {raw[:300]!r}{'...' if len(raw) > 300 else ''}")
-        return dict(_EMPTY_SUMMARY)
+        return {
+            "agenda": agenda_str,
+            "outcome_met": "unknown",
+            "outcome_note": "",
+            "action_items_md": action_items_md,
+        }
     except Exception as exc:
         print(f"  [summary extract error] {exc}")
-        return dict(_EMPTY_SUMMARY)
+        return {
+            "agenda": agenda_str,
+            "outcome_met": "unknown",
+            "outcome_note": "",
+            "action_items_md": action_items_md,
+        }
+
+    # Prefer state-derived fields when we have them - they're more
+    # trustworthy than re-extracted text.
+    agenda_out = agenda_str or str(data.get("agenda", "")).strip()
+    action_items_out = action_items_md or str(data.get("action_items_md", "")).strip()
+
+    return {
+        "agenda": agenda_out,
+        "outcome_met": str(data.get("outcome_met", "unknown")).strip().lower(),
+        "outcome_note": str(data.get("outcome_note", "")).strip(),
+        "action_items_md": action_items_out,
+    }
 
 
 def build_slack_summary(
@@ -570,6 +886,22 @@ async def run_moderator(
     if state is None:
         state = {}
     transcript: List[dict] = state.setdefault("transcript", [])
+    # Block 2 in-call tracking. These all live on state so main() (and
+    # finalize_call) can read them even after a Ctrl+C cancellation.
+    state.setdefault("agenda", [])
+    action_items: List[dict] = state.setdefault("action_items", [])
+    speaker_turns: dict = state.setdefault("speaker_turns", {})
+    # off_topic_streak tracks consecutive off-topic turns from the
+    # SAME speaker. Resets on a topical turn or a speaker change. This
+    # is what gates the redirect intervention (rule 2 in SYSTEM_PROMPT).
+    state.setdefault("off_topic_streak", 0)
+    state.setdefault("off_topic_last_speaker", None)
+    # nudged_set keeps track of which silent participants we've already
+    # invited to speak - we cap it at once per participant per meeting
+    # to avoid badgering people.
+    state.setdefault("nudged_set", set())
+    state.setdefault("follow_up", None)
+
     # `is_speaking` defends against the bot's own TTS audio bleeding back
     # into STT. In direct mode, the bot's voice is injected into the Meet's
     # audio bus, so the STT engine can transcribe it. We skip transcript.final
@@ -615,19 +947,36 @@ async def run_moderator(
                     # passed in from main() so we know what to compare against.
                     if name == bot_name:
                         continue
+                    # Seed the joiner in speaker_turns at 0 so the moderator's
+                    # per-turn context sees them even before they say anything.
+                    # Critical for rule 3 (silent-participant nudge): without
+                    # this, anyone who joins and stays quiet is invisible to
+                    # the bot and can never be nudged. Use setdefault so a
+                    # re-join (network blip) doesn't clobber an existing
+                    # turn count.
+                    speaker_turns.setdefault(name, 0)
                     if not greeted:
-                        # First human in - generate a greeting via Gemini so
-                        # the moderator's "voice" is consistent from turn one,
-                        # rather than a hard-coded canned line.
+                        # First human in - ask Gemini to open the meeting via
+                        # the moderator-structured path. SYSTEM_PROMPT's rule
+                        # #1 will make the bot ask for the agenda. We DON'T
+                        # hard-code "What's the agenda?" here - we let the
+                        # prompt drive it so phrasing stays consistent with
+                        # how the bot will sound on every subsequent turn.
                         greeted = True
-                        greeting = ask_gemini(
-                            chat,
-                            f"{name} just joined the call. Say a short, friendly hello "
-                            f"in one sentence. Use their first name.",
+                        prompt = (
+                            f"Meeting just started. {name} is the first human in "
+                            f"the room. No agenda is set yet. Open the meeting "
+                            f"with a brief agenda-soliciting line - address "
+                            f"{name} by their first name."
                         )
-                        if greeting:
-                            print(f"  [bot] {greeting}")
-                            transcript.append({"role": "moderator", "text": greeting})
+                        turn = ask_moderator_structured(chat, prompt)
+                        # An opening should always speak (rule 1 in
+                        # SYSTEM_PROMPT). If the model returned null,
+                        # something's wrong with the prompt - log and
+                        # continue silently rather than crashing.
+                        if turn["speak"]:
+                            print(f"  [bot] {turn['speak']}")
+                            transcript.append({"role": "moderator", "text": turn["speak"]})
                             # NB: the WebSocket protocol uses "type", not
                             # "command" - the bridge scripts translate the
                             # stdin "command" form into "type" for the WS.
@@ -635,12 +984,22 @@ async def run_moderator(
                             # message and no audio plays.
                             await ws.send(json.dumps({
                                 "type": "tts.speak",
-                                "text": greeting,
+                                "text": turn["speak"],
                                 "voice": voice,
                             }))
+                        else:
+                            print("  [bot] (no greeting returned by model — check prompt)")
+                        merge_turn_into_state(state, turn)
 
                 elif event_type == "participant.left":
-                    print(f"  - {speaker_name(event.get('name') or event.get('participant'))} left")
+                    leaver = speaker_name(event.get("name") or event.get("participant"))
+                    print(f"  - {leaver} left")
+                    # Remove from speaker_turns so the bot doesn't try to
+                    # nudge someone who's no longer in the room. The nudged_set
+                    # is small and harmless to leave alone (it just records
+                    # historical nudges).
+                    if leaver != bot_name:
+                        speaker_turns.pop(leaver, None)
 
                 elif event_type == "tts.started":
                     is_speaking = True
@@ -663,21 +1022,95 @@ async def run_moderator(
                     print(f"  [you] ({speaker}) {text}")
                     transcript.append({"role": "participant", "speaker": speaker, "text": text})
 
-                    # Hand the utterance to Gemini. The chat session keeps the
-                    # rolling history; we just send the latest turn.
-                    reply = ask_gemini(chat, f"{speaker}: {text}")
+                    # Bump this speaker's turn count BEFORE asking the model
+                    # so the per-turn prompt sees up-to-date numbers.
+                    speaker_turns[speaker] = speaker_turns.get(speaker, 0) + 1
 
-                    if not reply:
-                        # Gemini returned empty (safety filter, etc.) -
-                        # explicitly do NOT send a blank tts.speak.
-                        print("  [bot] (empty reply, skipping tts)")
+                    # Build the per-turn context the moderator sees. The
+                    # idea is to give the model just enough state to make
+                    # the five intervention decisions in SYSTEM_PROMPT
+                    # WITHOUT re-sending the entire transcript (it's
+                    # already in the chat's rolling history).
+                    agenda_now = state.get("agenda") or []
+                    agenda_line = ", ".join(agenda_now) if agenda_now else "NOT YET SET"
+                    turn_counts_line = ", ".join(
+                        f"{n}={c}" for n, c in sorted(speaker_turns.items(), key=lambda kv: -kv[1])
+                    ) or "(none yet)"
+                    total_turns = sum(speaker_turns.values())
+                    silent_list = [n for n, c in speaker_turns.items() if c == 0]
+                    silent_line = ", ".join(sorted(silent_list)) or "(none)"
+                    streak_line = (
+                        f"{state['off_topic_streak']} consecutive off-topic turn(s) by "
+                        f"{state['off_topic_last_speaker']}"
+                        if state.get("off_topic_streak") and state.get("off_topic_last_speaker")
+                        else "0 (no current streak)"
+                    )
+                    nudged_line = ", ".join(sorted(state["nudged_set"])) or "(none yet)"
+
+                    prompt = (
+                        # Today's date is the anchor for resolving any
+                        # relative due dates the speaker mentions ("by
+                        # Friday", "end of Q3", "28th of May"). Without
+                        # it, Gemini defaults to a year near its training
+                        # cutoff (e.g. 2024) instead of the current year.
+                        f"Today's date: {datetime.now():%Y-%m-%d (%A)}\n"
+                        f"Agenda: {agenda_line}\n"
+                        f"Speaker turn counts so far: {turn_counts_line}\n"
+                        f"Total participant turns: {total_turns}\n"
+                        f"Silent participants (0 turns): {silent_line}\n"
+                        f"Off-topic streak: {streak_line}\n"
+                        f"Already nudged (do NOT re-nudge): {nudged_line}\n"
+                        f"Current speaker: {speaker}\n"
+                        f"They just said: {text}"
+                    )
+
+                    turn = ask_moderator_structured(chat, prompt)
+
+                    # Update the off-topic streak BEFORE merging the rest of
+                    # the response. Streak machine semantics (group-wide):
+                    #   - ANY off_topic turn -> streak grows, regardless of
+                    #     who's speaking. A meeting drifting across Bob
+                    #     -> Alice -> Daniyal is just as much a moderator
+                    #     problem as one person rambling.
+                    #   - off_topic_last_speaker tracks the MOST RECENT
+                    #     drifter for context, not for gating - the model
+                    #     uses it to phrase the redirect ("Bob, if I may..").
+                    #   - NOT off_topic -> streak resets to 0.
+                    if turn["off_topic"]:
+                        state["off_topic_streak"] = (state["off_topic_streak"] or 0) + 1
+                        state["off_topic_last_speaker"] = speaker
+                    else:
+                        state["off_topic_streak"] = 0
+                        state["off_topic_last_speaker"] = None
+
+                    # Merge agenda / action items / follow-up suggestions.
+                    merge_turn_into_state(state, turn)
+
+                    # Speak only if the model decided to. Most turns this is
+                    # None and we stay silent - exactly the behavior change
+                    # Block 2 is shipping for.
+                    if not turn["speak"]:
+                        print("  [bot] (listening — no intervention)")
                         continue
 
-                    print(f"  [bot] {reply}")
-                    transcript.append({"role": "moderator", "text": reply})
+                    # If the model just nudged a silent participant, mark
+                    # them as nudged so we don't badger them next turn.
+                    # We use a heuristic: any participant who's been
+                    # mentioned by name in the speak text and currently has
+                    # turn-count <= 1 was probably the target of the nudge.
+                    for participant_name in list(speaker_turns.keys()):
+                        first_name = participant_name.split()[0]
+                        if (
+                            speaker_turns.get(participant_name, 0) <= 1
+                            and first_name.lower() in turn["speak"].lower()
+                        ):
+                            state["nudged_set"].add(participant_name)
+
+                    print(f"  [bot] {turn['speak']}")
+                    transcript.append({"role": "moderator", "text": turn["speak"]})
                     await ws.send(json.dumps({
                         "type": "tts.speak",
-                        "text": reply,
+                        "text": turn["speak"],
                         "voice": voice,
                     }))
 
@@ -762,18 +1195,13 @@ def finalize_call(
         )
         post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
         return
-    if chat is None:
-        # No chat session means run_moderator never got past startup -
-        # nothing to extract from. Still post the header so the channel
-        # sees the call happened.
-        body = build_slack_summary(
-            call_id, started_at, ended_at, bot_name, voice, end_reason,
-            dict(_EMPTY_SUMMARY),
-        )
-        post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
-        return
 
-    summary = extract_meeting_summary(chat, transcript)
+    # Block 2 onward: extract_meeting_summary prefers state-tracked
+    # agenda + action items (no hallucination risk) and only falls back
+    # to a one-shot Gemini call for outcome verdict + anything state
+    # didn't capture. No `chat` dependency - the chat is committed to
+    # the moderator schema and can't dual-purpose for summary output.
+    summary = extract_meeting_summary(transcript, state=state)
     body = build_slack_summary(
         call_id, started_at, ended_at, bot_name, voice, end_reason, summary,
     )
@@ -784,36 +1212,74 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
     """
     Interactive rehearsal mode - no AgentCall call, no WebSocket, no TTS.
 
-    Reads your typed sentences from stdin and prints Gemini's replies. Same
-    SYSTEM_PROMPT, same model, same chat session as the real run - so this
-    is a faithful test of the bot's *conversational behaviour* without
-    spending any AgentCall credits. Useful for prompt-tuning and edge-case
-    testing.
+    Reads your typed lines from stdin and runs each one through the SAME
+    structured moderator pipeline the live bot uses. Prints the bot's
+    decision per turn so you can see when it intervenes, when it stays
+    silent, and what state it has accumulated.
 
-    The Gemini Flash free tier is 1,500 requests/day, so this is effectively
-    free as well.
+    Free to run: the Gemini Flash free tier is 1,500 requests/day, and no
+    AgentCall credits are spent.
+
+    Suggested test scenarios to validate the prompt:
+      - agenda-setting: first turn says "today we want to plan the Q3
+        launch." -> bot should NOT respond verbally, but agenda_items
+        should populate.
+      - action-item capture: "Alice will own the pricing audit by
+        Friday." -> bot stays silent, new_action_items populates.
+      - off-topic redirect: type 2 unrelated lines back-to-back ("how
+        was your weekend?" / "did you watch the game?") -> bot redirects
+        on the second turn.
+      - direct address: "Juno, summarize what we have so far." -> bot
+        speaks.
+
+    At exit (empty line or Ctrl+C), the same Slack post the live path
+    would produce is built and (if --slack-channel was passed) posted.
     """
     print(f"[dry-run] {bot_name} is ready. Type a line and press Enter.")
     print("[dry-run] Empty line or Ctrl+C to exit.\n")
+    print("[dry-run] Tip: prepend a name + colon to speak as someone, e.g. 'Bob: hi all.'")
+    print("[dry-run] No name prefix = you speak as 'You'.")
+    print("[dry-run] To simulate someone joining the room SILENTLY (for rule 3 testing),")
+    print("[dry-run] type '/join Alice' — they'll appear at 0 turns in the bot's context.\n")
 
     chat = build_chat_session()
 
-    # Mirror the live transcript buffer so we can exercise the Slack
-    # extraction path on dry-run too. Cheaper than burning AgentCall credits
-    # every time we tweak the action-item prompt.
+    # Mirror the live state shape so the per-turn prompt enrichment and
+    # the end-of-call summary work identically.
     transcript: List[dict] = []
+    state: dict = {
+        "transcript": transcript,
+        "agenda": [],
+        "action_items": [],
+        "speaker_turns": {},
+        "off_topic_streak": 0,
+        "off_topic_last_speaker": None,
+        "nudged_set": set(),
+        "follow_up": None,
+        "chat": chat,
+    }
     started_at = datetime.now()
 
-    # Mirror the real flow's opening: the live bot greets on the first
-    # participant.joined. Do the same here so prompt-tuning covers the
-    # greeting path too.
-    greeting = ask_gemini(
-        chat,
-        "You just joined the call. Say a short, friendly hello in one sentence.",
+    # Opening turn: same agenda-soliciting prompt the live bot uses.
+    opening_prompt = (
+        "Meeting just started. A participant just joined. No agenda is "
+        "set yet. Open the meeting with a brief agenda-soliciting line."
     )
-    if greeting:
-        print(f"[bot] {greeting}\n")
-        transcript.append({"role": "moderator", "text": greeting})
+    opening_turn = ask_moderator_structured(chat, opening_prompt)
+    if opening_turn["speak"]:
+        print(f"[bot] {opening_turn['speak']}\n")
+        transcript.append({"role": "moderator", "text": opening_turn["speak"]})
+    merge_turn_into_state(state, opening_turn)
+
+    def _parse_speaker(line: str) -> tuple:
+        """Split 'Bob: hello' -> ('Bob', 'hello'), else ('You', line)."""
+        if ":" in line:
+            head, _, rest = line.partition(":")
+            head = head.strip()
+            rest = rest.strip()
+            if head and rest and len(head.split()) <= 3:
+                return head, rest
+        return "You", line
 
     try:
         while True:
@@ -823,13 +1289,86 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
                 break
             if not user_text:
                 break
-            transcript.append({"role": "participant", "speaker": "You", "text": user_text})
-            reply = ask_gemini(chat, f"You: {user_text}")
-            if not reply:
-                print("[bot] (empty reply)\n")
+
+            # /join <Name> simulates someone joining the room silently - the
+            # live path gets this for free via participant.joined events from
+            # AgentCall, but dry-run has no event stream so we expose it as a
+            # slash command. Critical for rule 3 testing (silent-participant
+            # nudge): without it, the bot has no way to know a quiet
+            # participant exists.
+            if user_text.startswith("/join "):
+                joinee = user_text[len("/join "):].strip()
+                if joinee:
+                    state["speaker_turns"].setdefault(joinee, 0)
+                    print(f"[state] +participant {joinee} (silent, 0 turns)\n")
+                else:
+                    print("[dry-run] usage: /join <Name>\n")
                 continue
-            print(f"[bot] {reply}\n")
-            transcript.append({"role": "moderator", "text": reply})
+
+            speaker, text = _parse_speaker(user_text)
+            transcript.append({"role": "participant", "speaker": speaker, "text": text})
+            state["speaker_turns"][speaker] = state["speaker_turns"].get(speaker, 0) + 1
+
+            agenda_now = state.get("agenda") or []
+            agenda_line = ", ".join(agenda_now) if agenda_now else "NOT YET SET"
+            turn_counts_line = ", ".join(
+                f"{n}={c}" for n, c in sorted(state["speaker_turns"].items(), key=lambda kv: -kv[1])
+            ) or "(none yet)"
+            total_turns = sum(state["speaker_turns"].values())
+            silent_list = [n for n, c in state["speaker_turns"].items() if c == 0]
+            silent_line = ", ".join(sorted(silent_list)) or "(none)"
+            streak_line = (
+                f"{state['off_topic_streak']} consecutive off-topic turn(s) by "
+                f"{state['off_topic_last_speaker']}"
+                if state.get("off_topic_streak") and state.get("off_topic_last_speaker")
+                else "0 (no current streak)"
+            )
+            nudged_line = ", ".join(sorted(state["nudged_set"])) or "(none yet)"
+            prompt = (
+                # See live-path prompt for why we ship today's date.
+                f"Today's date: {datetime.now():%Y-%m-%d (%A)}\n"
+                f"Agenda: {agenda_line}\n"
+                f"Speaker turn counts so far: {turn_counts_line}\n"
+                f"Total participant turns: {total_turns}\n"
+                f"Silent participants (0 turns): {silent_line}\n"
+                f"Off-topic streak: {streak_line}\n"
+                f"Already nudged (do NOT re-nudge): {nudged_line}\n"
+                f"Current speaker: {speaker}\n"
+                f"They just said: {text}"
+            )
+
+            turn = ask_moderator_structured(chat, prompt)
+
+            # Group-wide streak: any off-topic turn from anyone grows it.
+            # See the matching block in run_moderator for full reasoning.
+            if turn["off_topic"]:
+                state["off_topic_streak"] = (state["off_topic_streak"] or 0) + 1
+                state["off_topic_last_speaker"] = speaker
+            else:
+                state["off_topic_streak"] = 0
+                state["off_topic_last_speaker"] = None
+
+            merge_turn_into_state(state, turn)
+
+            # Per-turn diagnostics so we can see what the bot decided.
+            decisions: List[str] = []
+            if turn["agenda_items"]:
+                decisions.append(f"agenda={turn['agenda_items']}")
+            if turn["new_action_items"]:
+                decisions.append(f"+{len(turn['new_action_items'])} action item(s)")
+            if turn["off_topic"]:
+                decisions.append("off_topic=true")
+            if turn["follow_up_meeting"]:
+                decisions.append("follow_up suggested")
+            if decisions:
+                print(f"[state] {' | '.join(decisions)}")
+
+            if not turn["speak"]:
+                print("[bot] (silent)\n")
+                continue
+
+            print(f"[bot] {turn['speak']}\n")
+            transcript.append({"role": "moderator", "text": turn["speak"]})
     except KeyboardInterrupt:
         print()  # newline after ^C
 
@@ -841,7 +1380,7 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
         elif not transcript:
             print("[dry-run] Nothing to post to Slack (empty session).")
         else:
-            summary = extract_meeting_summary(chat, transcript)
+            summary = extract_meeting_summary(transcript, state=state)
             body = build_slack_summary(
                 call_id="dry-run",
                 started_at=started_at,

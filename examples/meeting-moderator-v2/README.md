@@ -1,10 +1,28 @@
 # Meeting Moderator v2 (active workbench)
 
-A minimal **STT → LLM → TTS** loop: the bot joins a Google Meet, AgentCall transcribes whoever's talking, the utterance is sent to **Google Gemini**, and Gemini's reply is spoken back through the bot using AgentCall's TTS.
+A **mostly-silent virtual meeting moderator**: the bot joins a Google Meet, listens, captures action items + agenda + drift signals into structured state on every turn, and only speaks when one of five intervention triggers fires. When the call ends, it posts a rich markdown summary to Slack.
 
-**v2 vs v1.** `examples/meeting-moderator/` is the **frozen** demo-safe baseline. This folder (`examples/meeting-moderator-v2/`) is the **active workbench** — all new behaviour (moderator prompt, structured output, Slack delivery, Calendar follow-ups) lands here. v1 stays untouched as a fallback for the 2026-05-21 innovation-day demo.
+**v2 vs v1.** `examples/meeting-moderator/` is the **frozen** demo-safe baseline (a chatty STT→LLM→TTS round-trip with no moderator behaviour). This folder (`examples/meeting-moderator-v2/`) is the **active workbench** — all new behaviour (moderator prompt, structured output, Slack delivery, Calendar follow-ups) lands here. v1 stays untouched as a fallback for the 2026-05-21 innovation-day demo.
 
-**Block 1 (this iteration) adds Slack action-item delivery.** When you pass `--slack-channel`, the bot posts a markdown action-item summary to a configured Slack channel as soon as the call ends. Moderator-specific gating (agenda enforcement, speaker fairness) is still TODO — that's Block 2.
+## What's shipped so far
+
+| Block | Status | What it does |
+|---|---|---|
+| 1 — Slack delivery | ✅ done | End-of-call post to a configured channel: header (duration, bot, end reason), agenda, action items, outcome verdict. |
+| 2 — Moderator prompt + structured output | ✅ done | Bot speaks only on 5 trigger conditions, captures agenda + action items + follow-ups deterministically every turn via JSON-mode Gemini. |
+| 3 — Google Calendar follow-ups | ⏳ deferred | Schedule a follow-up event when one is proposed during the call. |
+
+## Moderator behaviour (Block 2)
+
+The bot is **silent by default**. It only speaks when one of these triggers fires:
+
+1. **Agenda-setting** — opening turn asks "what's the agenda for today's call?" once.
+2. **Off-topic redirect** — after two consecutive off-topic turns from the same speaker, the bot redirects with one short sentence.
+3. **Silent-participant nudge** — if one person dominates while another hasn't spoken, the bot gently invites the quiet person by name. At most once per person per meeting.
+4. **Direct address** — someone calls the bot by name ("Juno, what do you think?"). Bot answers briefly.
+5. **Wrap-up recap** — when the conversation is clearly winding down ("thanks all" / "let's end here"), the bot reads back the captured action items.
+
+Every turn, Gemini returns a JSON object: `{speak, agenda_items, new_action_items, off_topic, follow_up_meeting}`. The script merges it into rolling state and only sends `tts.speak` if `speak` is non-null. This is what makes the bot feel like a moderator instead of a chatty companion.
 
 ## What It Does
 
@@ -137,30 +155,58 @@ Default voice is `bm_george` (British male). The voice is sent on **every** `tts
 - **Multi-participant** — invite a colleague to the same Meet. Both speakers should appear in `[you] (<name>) ...` lines; the bot replies to whichever utterance came last.
 - **Bot kicked from Meet side** — click "Remove" on the Mod participant inside Meet instead of Ctrl+C-ing the script. Terminal should print `Call ended: <reason>`, save the transcript, then call cleanup. Verify the dashboard shows no active calls.
 
-### Slack pipeline test (no credits)
+### Dry-run prompt tuning (no credits)
 
-This validates the action-item extraction + Slack post path without spending AgentCall credits.
+`--dry-run` exercises the **full Block 2 pipeline** (system prompt, structured Gemini, state merge, Slack post) from your terminal — no AgentCall credits, no Google Meet needed. Use this to validate prompt tweaks before burning a live call.
 
-1. Make sure `SLACK_BOT_TOKEN` is in `.env` and the channel exists.
-2. Run:
-   ```bash
-   python examples/meeting-moderator-v2/moderator.py --dry-run \
-       --slack-channel "#moderator-action-items"
+```bash
+python examples/meeting-moderator-v2/moderator.py --dry-run \
+    --slack-channel "#moderator-action-items"
+```
+
+Each line you type is treated as one utterance. The script prints:
+- `[state] ...` if anything was merged into state on that turn (agenda set, action items added, off-topic detected, follow-up proposed)
+- `[bot] (silent)` when the model decided not to intervene (the common case)
+- `[bot] <text>` when an intervention fired
+
+To simulate multiple participants, prefix lines with `Name:`. So `Alice: I think we should...` registers as Alice speaking, increasing her turn count in the state the model sees.
+
+**Suggested test scenarios:**
+
+1. **Agenda-setting + action capture**
    ```
-3. Type 4–5 lines that include clear action items, e.g.
+   > Daniyal: Today we're planning the Q3 launch.
+   > Daniyal: Alice will own the pricing audit by Friday.
+   > Bob: I can draft the launch comms by next Wednesday.
    ```
-   > Hi everyone, let's plan the Q3 launch.
-   > Alice will own the pricing audit by Friday.
-   > Bob will draft the launch comms by next Wednesday.
-   > Daniyal will share the dashboard mock by tomorrow.
-   > thanks all
+   Expected: bot stays silent on all three. `[state]` lines show agenda captured on turn 1, action items captured on turns 2 and 3.
+
+2. **Off-topic redirect** (needs 2 off-topic turns from same speaker)
    ```
-4. Press **Enter on an empty line** to exit.
-5. Expected terminal output:
+   > Daniyal: Today we're planning the Q3 launch.
+   > Bob: How was everyone's weekend?
+   > Bob: Did you watch the football game?
    ```
-   Slack post ok (channel=#moderator-action-items, ts=...).
+   Expected: bot silent on turn 2 (single drift is fine), bot redirects on turn 3 (two in a row from Bob).
+
+3. **Silent-participant nudge**
    ```
-6. Open Slack and confirm the channel has a new post titled **`[dry-run] Meeting summary — ...`** with a bullet list of action items.
+   > Daniyal: Today we're planning the Q3 launch.
+   > Daniyal: I think we should prioritize feature X.
+   > Daniyal: And feature Y is critical.
+   > Daniyal: Plus we need to retire feature Z.
+   > Alice: hi
+   ```
+   Expected: at some point during Daniyal's run of turns, the bot invites Alice by name.
+
+4. **Direct address**
+   ```
+   > Daniyal: Today we're planning the Q3 launch.
+   > Bob: Juno, summarize what we have so far.
+   ```
+   Expected: bot answers briefly.
+
+End the session with an empty line. If `--slack-channel` was passed, the Slack post fires (prefixed `[dry-run]`).
 
 Common Slack failures the script will print a hint for:
 - `not_in_channel` → add the bot to the channel, or confirm the `chat:write.public` scope is granted.
@@ -195,13 +241,11 @@ You should see `meeting-moderator-log-YYYY-MM-DD-HHMM.md` in your current workin
 
 ## What's intentionally out of scope (deferred to later iterations)
 
-- Moderator-specific gating ("only speak when X happens") — **Block 2**
-- Per-speaker tracking (who's dominated, who hasn't spoken) — **Block 2**
-- Meeting phase state machine (agenda / discussion / wrap-up) — **Block 2**
-- Google Calendar follow-up scheduling — **Block 3** (stretch)
-- Per-person Slack DMs (channel-only for now)
+- Google Calendar follow-up scheduling — **Block 3** (stretch goal; uses `state["follow_up"]` captured during the call to schedule a follow-up event)
+- Per-person Slack DMs (channel-only for now — see [slack_client.py](slack_client.py) for the extension point)
 - Streaming the TTS sentence-by-sentence for lower latency
 - Visual avatar (`bridge-visual.py` route) — known-broken `--avatar` flag
+- Auto-leave when the room empties out (manual Ctrl+C still required)
 
 ## Picking a different voice
 

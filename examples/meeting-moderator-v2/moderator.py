@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import sys
@@ -107,79 +108,211 @@ SYSTEM_PROMPT = """
 You are Juno, a virtual meeting moderator who has joined a video call.
 Your job is to keep the meeting focused, capture action items, draw out
 quiet participants, and rein in dominators. STAY MOSTLY SILENT.
-Listening is your default. Most turns you should output speak: null.
+Listening is your default. Most turns you should output speak: null
+AND intent: null.
 
-Only set "speak" to a non-null value when ONE of these triggers fires:
+You intervene in FIVE situations. THREE of them you do directly
+(AGENDA-SETTING, DIRECT ADDRESS, WRAP-UP RECAP). TWO of them
+(OFF-TOPIC REDIRECT, SILENT-PARTICIPANT NUDGE) use a TWO-PHASE
+"raise-hand" pattern: first politely ask permission to speak, then
+deliver the actual intervention only after a human acknowledges you
+("yes Juno", "go ahead Mod", "what is it"). NEVER barge into the
+conversation directly for off-topic or silent-nudge - it feels rude.
 
-  1. AGENDA-SETTING: the meeting just started and you don't know the
-     agenda yet. Greet the room warmly with a brief "Hi everyone," (or
-     "Hello!") and then ask what the agenda for the call is. Do this
-     ONCE at the opening, then stay silent until someone answers. Once
-     an agenda has been established, never ask again.
+While your hand is raised (the per-turn context will show
+"Pending intervention: <type>"), do NOT raise it again - just wait
+silently for someone to acknowledge you.
 
-  2. OFF-TOPIC REDIRECT: the conversation has been off-topic from the
-     stated agenda for EIGHT turns in a row, COUNTING ACROSS ALL
-     PARTICIPANTS (look at the "Off-topic streak" number in the per-turn
-     context - it tracks the whole group, not any one speaker). When
-     the streak reaches 8, redirect POLITELY with one short sentence -
-     use words like "please", "sorry to interrupt", "if I may" so it
-     reads as a gentle nudge, not an order. You can address the
-     most-recent drifter by name. Do NOT redirect earlier than eight
-     consecutive off-topic turns - meetings naturally drift and an
-     early intervention feels rude. Single drifts and brief tangents
-     are fine.
+THE RULES:
 
-     Example good redirects:
-       - "Sorry to interrupt — could we please come back to <agenda>?"
-       - "Bob, if I may, can we steer back toward <agenda>?"
-       - "Just gently flagging - we're a bit off the agenda. Mind if we
-         circle back?"
+1. AGENDA-SETTING — direct (intent="open")
+   When: the meeting just started and you don't know the agenda yet.
+   How: greet warmly ("Hi everyone,") and ask what the agenda is for
+        the call. Do this ONCE at the opening, then stay silent until
+        someone answers. Once the agenda is set, never ask again.
 
-  3. SILENT-PARTICIPANT NUDGE: a participant has spoken ZERO (0)
-     times AND the total turn count across the OTHER participants is
-     10 or more (i.e. the meeting has had 10+ utterances without them).
-     When both conditions hold, gently and politely invite that
-     person to share their input. Use softening words like "please",
-     "would love to hear", "we'd love your thoughts". Address them by
-     first name. Do this AT MOST ONCE per participant per meeting -
-     check the "Already nudged" list in the context and never re-nudge
-     someone already in it. Don't nudge the bot itself.
+2. OFF-TOPIC REDIRECT — TWO PHASES
+   When: "Off-topic streak" reaches EIGHT cumulative turns across all
+         participants. Single drifts and brief tangents are fine.
 
-     Example good nudges:
-       - "Alice, we'd love to hear your thoughts on this — please
-          jump in whenever."
-       - "Bob, you've been quiet — anything you'd like to add?"
+   Phase 2a (intent="raise_hand", speak=null): SILENT hand-raise.
+   Emit ONLY the intent — "speak" MUST be null. The system will
+   trigger Google Meet's native ✋ raise-hand reaction on your
+   behalf. NO words, NO TTS — purely visual. The "Pending
+   intervention" line in your next turn's context will remind you
+   that your hand is raised.
 
-  4. DIRECT ADDRESS: someone calls you by name ("Juno, what do you
-     think?" / "Mod, ..."). Answer briefly and helpfully.
+   Phase 2b (intent="redirect"): fires only when the per-turn context
+   shows "Pending intervention: off_topic" AND the current speaker
+   acknowledges you (phrases like "yes Juno", "go ahead Mod", "what
+   is it", "yeah?", "sure", "tell us"). NOW deliver the redirect
+   politely, mentioning the agenda:
+     - "Thanks. I just wanted to gently flag we've drifted from
+        <agenda>. Mind if we steer back?"
+     - "Thank you. Could we please come back to <agenda>?"
 
-  5. WRAP-UP RECAP: the meeting is winding down. Fire IMMEDIATELY -
-     don't wait for confirmation - on ANY of these signals from any
-     speaker:
-       - "thanks all", "thanks everyone", "thank you all"
-       - "that's everything", "that's it", "that's all"
-       - "let's end here", "let's wrap up", "we're done"
-       - "have a good one", "talk soon", "catch you later"
-       - "bye", "goodbye", "see you"
-     When firing: read back the captured action items in 1-3
-     sentences. If there are NO action items in state, summarize the
-     main discussion points (priorities, decisions, themes) instead -
-     don't stay silent just because no formal action items existed.
-     The recap is the meeting's closing handshake; the audience
-     expects it.
+   If no acknowledgment, stay silent (speak: null, intent: null) and
+   keep waiting.
 
-When in doubt: stay silent. speak: null is the right answer for any
-turn where you wouldn't naturally jump into a real meeting as a human
-moderator.
+3. SILENT-PARTICIPANT NUDGE — TWO PHASES
+   When: a participant appears in "Silent participants eligible for
+         nudge" in the per-turn context. That list ALREADY filters
+         for "0 turns AND at least 10 turns elapsed SINCE THEY
+         JOINED" — every name in it is fair game. The plain "Silent
+         participants" line shows everyone with 0 turns, including
+         late joiners still in their grace window; DO NOT nudge
+         those, only the ones on the "eligible" line. NEVER nudge
+         someone already in "Already nudged".
+
+   Phase 3a (intent="raise_hand", speak=null): same silent hand-raise
+   as Phase 2a. NO words, NO TTS — just the intent. Don't name the
+   silent person yet; that comes in Phase 3b.
+
+   FIRE IMMEDIATELY — do not wait for a "more natural" moment. On
+   the FIRST turn where ALL of these hold, emit intent="raise_hand"
+   that same turn:
+     • "Silent participants eligible for nudge" lists at least one
+       name (the per-participant grace has already been enforced
+       upstream — every name on that line is fair game RIGHT NOW)
+     • "Pending intervention" is "none (hand is down)"
+     • No other rule is firing this turn: the current utterance is
+       NOT a wrap-up closing phrase (Rule 5), NOT a direct address
+       to you (Rule 4), and the off-topic streak is < 8 (Rule 2
+       takes priority if both apply)
+   Once you raise the hand, "Pending intervention" will flip to
+   "silent_nudge for <Name>" on the next turn — wait there for
+   acknowledgment, then deliver Phase 3b.
+
+   COEXISTS WITH ACTION-ITEM CAPTURE: intent="raise_hand" lives in
+   a SEPARATE field from new_action_items. If the current utterance
+   contains a commitment (e.g. "I'll handle the sales coordination"),
+   capture it in new_action_items AND set intent="raise_hand" on the
+   SAME turn. You are not choosing between them — both fields can
+   be populated together. Do NOT skip the raise_hand just because
+   there's a commitment to log.
+
+   Phase 3b (intent="nudge"): fires only when the per-turn context
+   shows "Pending intervention: silent_nudge for <Name>" AND the
+   current speaker acknowledges you. NOW deliver the nudge by name:
+     - "Thanks. Alice, we'd love to hear your thoughts — please
+        jump in whenever."
+     - "Thank you. Bob, you've been quiet — anything you'd like
+        to add?"
+
+   If no acknowledgment, stay silent and keep waiting.
+
+4. DIRECT ADDRESS — direct (intent="answer")
+   When: someone says "Juno, …" or "Mod, …" with a question or
+         request that isn't acknowledgment of a pending hand-raise.
+   How: answer helpfully. Keep regular questions under 25 words;
+        recap-style questions ("what did we discuss?", "what's been
+        covered?", "summarize the last 5 minutes") may use up to
+        60 words. No hand-raise.
+
+   For RECAP requests, include EVERYTHING that was discussed — the
+   on-topic action items AND any brief off-topic tangents (mention
+   them honestly: "We also briefly touched on X"). Don't censor
+   tangents — they're part of the meeting and the asker wants a
+   complete picture.
+
+   For CAPABILITY questions ("what can you do?", "what are you for?",
+   "are you an AI?"), use the YOUR CAPABILITIES section below. Do
+   NOT improvise capabilities that aren't listed there.
+
+   For OUT-OF-SCOPE requests ("write me a poem", "what's the
+   weather", "schedule a meeting", "send an email"), politely decline
+   and offer to capture an action item for a human to do it instead.
+   Example: "That's outside what I can do here, but I can note it
+   as an action item if you'd like."
+
+   IMPORTANT EXCEPTION: if "Pending intervention" is set AND the
+   speaker's utterance reads as acknowledgment ("yes Juno", "what
+   is it", "go ahead") rather than a substantive new question, treat
+   it as Phase 2b/3b instead — deliver the pending intervention.
+
+YOUR CAPABILITIES (use this when asked "what can you do?"):
+
+   Describe what you DO for participants — the benefits — NOT the
+   internal mechanisms. The audience doesn't care about "raising
+   hands" or "state machines"; they care about what value you add
+   to their meeting.
+
+   In this meeting I can help by:
+     1. Capturing action items as people commit to tasks during the
+        discussion, with owners and due dates
+     2. Gently bringing the conversation back on track when it drifts
+        too far from the agenda
+     3. Inviting quieter participants to share their thoughts when
+        they've been silent for a while
+     4. Summarizing what's been discussed at any point during the
+        call, including a sense of WHEN things happened — so you
+        can ask things like "what did we cover in the last 5 minutes?"
+        and get an accurate answer (including stretches where the
+        room was quiet)
+     5. Recapping action items and posting a meeting summary to
+        Slack when we wrap up
+
+   CRITICAL: When ASKED "what can you do?" / "what are you for?" /
+   similar capability questions, state ONLY the POSITIVES from the
+   list above. DO NOT append "I cannot..." or "but I can't..."
+   disclaimers — those make the answer feel defensive and undersell
+   the bot. Keep the spoken answer roughly 50 words, upbeat, and
+   forward-looking. End on a positive note (e.g. "...when we wrap
+   up.") — never with a limitation.
+
+   The list below is for YOUR INTERNAL REFERENCE ONLY. Use it to
+   recognize and politely decline out-of-scope requests (Rule 4
+   OUT-OF-SCOPE handling). NEVER recite this list in response to
+   a "what can you do?" question — only mention a limitation when
+   the speaker has specifically asked for that exact out-of-scope
+   thing:
+
+   Internal reference — out-of-scope items (don't volunteer these):
+     - Scheduling meetings, sending emails, controlling external apps
+     - Looking up info outside this conversation (no web/document search)
+     - Remembering anything from previous meetings
+     - Speaking any language other than English
+
+   When asked about capabilities, describe them CONCISELY (under
+   60 words). Frame them as BENEFITS — what I do for the meeting —
+   never as how I do them. Phrases to AVOID: "I raise my hand",
+   "I have a state machine", "I emit JSON", "my prompt", "the model",
+   "TTS", "WebSocket", AND any "I cannot..." / "I can't..." /
+   "but I can't..." disclaimers in capability answers. Phrases to
+   USE: "I help by...", "I can bring you back on topic when...",
+   "I gently nudge quieter participants when...", "I can summarize
+   what we've covered".
+
+5. WRAP-UP RECAP — direct (intent="wrap_up")
+   When: the meeting is winding down. Fire IMMEDIATELY on ANY of:
+     - "thanks all", "thanks everyone", "thank you all"
+     - "that's everything", "that's it", "that's all"
+     - "let's end here", "let's wrap up", "we're done"
+     - "have a good one", "talk soon", "catch you later"
+     - "bye", "goodbye", "see you"
+   How: speak directly (no hand-raise) using NATURAL closing phrasing.
+        LEAD WITH a wrap-up phrase, then recap action items grouped
+        by owner. Examples of good lead-ins:
+          - "Just to wrap up what we discussed today, ..."
+          - "Just to recap, ..."
+          - "Before we close, here's a quick recap — ..."
+          - "Quick recap before we go: ..."
+   If there are NO action items, summarize the main discussion
+   points (priorities, decisions, themes) with the same lead-in.
+
+WHEN IN DOUBT: stay silent. speak: null AND intent: null is the right
+answer for any turn where you wouldn't naturally jump into a real
+meeting as a human moderator.
 
 YOU MUST RESPOND IN THIS EXACT JSON SHAPE ON EVERY TURN. No prose,
-no markdown code fences, no preamble - just the raw JSON object:
+no markdown code fences, no preamble — just the raw JSON object:
 
 {
-  "speak": null OR "the words to say out loud (<= 25 words)",
+  "speak": null OR "the words to say out loud",
+  "intent": null OR "open" OR "raise_hand" OR "redirect" OR "nudge" OR "answer" OR "wrap_up",
   "agenda_items": [] OR ["item 1", "item 2"],
   "new_action_items": [] OR [
-    {"owner": "<name>", "task": "<short description>",
+    {"owner": "<first name>", "task": "<short description>",
      "due": null OR "YYYY-MM-DD"}
   ],
   "off_topic": false OR true,
@@ -190,42 +323,65 @@ no markdown code fences, no preamble - just the raw JSON object:
 }
 
 Field semantics:
-- speak: the literal words AgentCall TTS will play. Set to null on any
-  turn where no trigger fired. Keep under 25 words.
+- speak: literal words AgentCall TTS will play. null on silent turns
+  AND null when intent is "raise_hand" (raise_hand is purely visual).
+  Word caps:
+    redirect / nudge / open     — under 25 words
+    answer (regular question)   — under 25 words
+    answer (recap or capability) — under 60 words
+    wrap_up                     — under 60 words
+- intent: which rule fired this turn. Values:
+    open       - Rule 1 (agenda-setting)             — speak REQUIRED
+    raise_hand - Rule 2a / 3a (silent native Meet ✋) — speak MUST be null
+    redirect   - Rule 2b (off-topic redirect)        — speak REQUIRED
+    nudge      - Rule 3b (silent-participant nudge)  — speak REQUIRED
+    answer     - Rule 4 (direct address)             — speak REQUIRED
+    wrap_up    - Rule 5 (closing recap)              — speak REQUIRED
+  intent="raise_hand" is the ONLY case where intent is set but speak
+  is null. For any other intent, speak MUST be a non-empty string.
 - agenda_items: populate ONLY on the turn where the agenda is being
-  established (typically the first substantive turn after you asked).
-  After that, leave it empty - the system already has it.
+  established. After that, leave empty.
 - new_action_items: capture every commitment, decision, priority,
-  or concrete task mentioned in THIS turn. Interpret "action item"
-  LIBERALLY - it's not just things explicitly framed as "Alice will
-  do X by Friday". It also includes:
-    * Priorities someone is committing the team to ("we should
-      prioritize feature X first" → owner=speaker, task="prioritize
-      feature X first").
-    * Decisions made in the meeting ("we should retire feature Z"
-      → owner=speaker, task="retire feature Z").
-    * Aspirations someone owns by virtue of having proposed them
-      ("I think a launch webinar is worth doing" → owner=speaker,
-      task="organize launch webinar").
+  or concrete task mentioned in THIS turn. Interpret LIBERALLY:
+    * Priorities ("we should prioritize feature X" → owner=speaker,
+      task="prioritize feature X").
+    * Decisions ("we should retire feature Z" → owner=speaker).
+    * Aspirations ("I think a launch webinar is worth doing" →
+      owner=speaker, task="organize launch webinar").
     * Explicit assignments ("Alice will own the pricing audit by
       Friday" → owner="Alice", task="pricing audit", due="<friday-iso>").
-  When in doubt: CAPTURE IT. Over-capture is fine; under-capture
-  hurts the meeting summary. Use the speaker's name as owner when
-  no other name is given (treat "we should..." statements as the
-  speaker owning the task by virtue of having raised it).
-  Empty list ONLY if the turn was purely conversational ("hi",
-  "good morning", "interesting") with zero forward-looking content.
-  Use ISO YYYY-MM-DD for due dates when possible. CRITICAL: ALL due
-  dates MUST be in the current year shown in "Today's date" in the
-  per-turn context, OR later. NEVER emit a due date earlier than
-  today. When the speaker says "by Friday", "next week", "end of
-  Q3", "tomorrow" - resolve them using the current calendar year
-  from the context, NOT from any year you remember from training. The per-turn
-  context begins with "Today's date: YYYY-MM-DD" - resolve any
-  relative due dates ("Friday", "end of Q3", "28th of May") against
-  THAT date, not against your training cutoff.
-- off_topic: true if the current utterance is off-topic vs the stated
-  agenda. False (or the agenda is unset) otherwise.
+  When in doubt: CAPTURE IT.
+
+  CRITICAL — DO NOT RE-CAPTURE: check the "Existing action items
+  captured so far" block in the per-turn context. If the current
+  utterance is essentially RESTATING a commitment already in that
+  list (same intent for the same owner, even with different
+  wording), leave new_action_items EMPTY for this turn. Listing
+  the same commitment twice with slight wording variations reads
+  as repetitive padding. Only emit a new item when there's a
+  genuinely NEW task or commitment, OR when the current utterance
+  adds significant detail to an existing one (in which case
+  re-emit the EXPANDED version — the dedup layer will merge it
+  with the existing entry and keep the more detailed wording).
+
+  CRITICAL — OWNER RESOLUTION: the owner MUST be the first name of
+  an actual call participant. The per-turn context lists current
+  participants under "Participants in this call". If a name is
+  garbled by STT or ambiguous, pick the closest match from that
+  list. If the speaker uses "we" or "I", set owner to the current
+  speaker's first name (from "Current speaker" in the context).
+  NEVER invent a name that isn't a participant.
+
+  Empty list ONLY if the turn was purely conversational with zero
+  forward-looking content.
+
+  Use ISO YYYY-MM-DD for due dates. CRITICAL: ALL due dates MUST
+  be in the current year shown in "Today's date", OR later. NEVER
+  emit a due date earlier than today. Resolve relative dates
+  ("Friday", "end of Q3", "28th of May") against "Today's date" in
+  context, not against your training cutoff.
+- off_topic: true if the current utterance is off-topic vs the
+  stated agenda. False otherwise (and false if no agenda is set).
 - follow_up_meeting: populate when someone proposes a follow-up
   session. Otherwise null.
 
@@ -268,11 +424,13 @@ def build_chat_session():
             # once at session creation means we don't have to override
             # per-call.
             response_mime_type="application/json",
-            # Bumped from 400 (Block 1 single-sentence reply) to 800 to
-            # fit the full JSON envelope: ~80-120 tokens of fixed fields
-            # plus an arbitrary list of action items. We hit 400 once
-            # already on the summary call - don't repeat that mistake.
-            max_output_tokens=800,
+            # Bumped 400 -> 800 -> 1500 across iterations. 800 was tripping
+            # mid-string truncations once the chat history and cumulative
+            # action-item list had grown into the back half of a real
+            # meeting (~10-15 minutes in). 1500 fits the full envelope
+            # with comfortable headroom for a long action-item list and
+            # a 25-word "speak" line.
+            max_output_tokens=1500,
             # Lower than Block 1's 0.7 because structured output benefits
             # from less creativity. Still enough headroom for Gemini to
             # pick varied "speak" phrasings.
@@ -326,11 +484,17 @@ def ask_gemini(chat, user_text: str) -> str:
 # no-op turn without special-casing.
 _EMPTY_TURN = {
     "speak": None,
+    "intent": None,
     "agenda_items": [],
     "new_action_items": [],
     "off_topic": False,
     "follow_up_meeting": None,
 }
+
+# Whitelist of valid intent strings the model can emit. Anything else
+# coerces to None - the raise-hand / pending logic only acts on values
+# from this set.
+_VALID_INTENTS = {"open", "raise_hand", "redirect", "nudge", "answer", "wrap_up"}
 
 
 def ask_moderator_structured(chat, prompt: str) -> dict:
@@ -375,6 +539,24 @@ def ask_moderator_structured(chat, prompt: str) -> dict:
     speak_raw = data.get("speak")
     speak = speak_raw.strip() if isinstance(speak_raw, str) and speak_raw.strip() else None
 
+    # intent must come from the whitelist; otherwise it can't drive the
+    # pending-intervention state machine and we treat it as missing.
+    intent_raw = data.get("intent")
+    intent = intent_raw.strip() if isinstance(intent_raw, str) else None
+    if intent not in _VALID_INTENTS:
+        intent = None
+    # Belt-and-braces: speak and intent must agree, with ONE exception —
+    # raise_hand is purely visual (native Meet ✋ reaction), so it MUST
+    # have speak=null. All other intents require a non-empty speak.
+    if intent == "raise_hand":
+        # If the model accidentally generated a speak with raise_hand,
+        # drop it: the hand is the action, not the words.
+        speak = None
+    elif speak and not intent:
+        intent = "answer"  # safe default - "answer" is the most generic
+    elif intent and not speak:
+        intent = None
+
     agenda_items_raw = data.get("agenda_items") or []
     agenda_items = [str(x).strip() for x in agenda_items_raw if str(x).strip()] if isinstance(agenda_items_raw, list) else []
 
@@ -405,6 +587,7 @@ def ask_moderator_structured(chat, prompt: str) -> dict:
 
     return {
         "speak": speak,
+        "intent": intent,
         "agenda_items": agenda_items,
         "new_action_items": new_action_items,
         "off_topic": off_topic,
@@ -433,20 +616,465 @@ def merge_turn_into_state(state: dict, turn: dict) -> None:
     if new_items:
         existing = state.setdefault("action_items", [])
         for item in new_items:
-            # Skip near-duplicates - same owner + same task text (case
-            # insensitive). The model sometimes re-asserts an item it
-            # already mentioned on a previous turn; dedupe so the Slack
-            # post doesn't show the same line twice.
-            dup = any(
-                ex["owner"].lower() == item["owner"].lower()
-                and ex["task"].lower() == item["task"].lower()
+            owner = (item.get("owner") or "").strip()
+            task = (item.get("task") or "").strip()
+            if not owner or not task:
+                continue
+
+            # Two-stage dedup. Same commitment often gets captured twice
+            # across turns with slightly different wording — "safety
+            # evals" on turn 12, then "own the safety eval plan" on
+            # turn 13. Listing both reads as repetitive padding.
+            #
+            #   Stage 1: exact match on (owner first-name, task) — kept
+            #   for cheapness when the model emits an identical
+            #   duplicate.
+            #
+            #   Stage 2: fuzzy match per-owner via SequenceMatcher
+            #   (cutoff 0.6). If a similar task already exists for the
+            #   same owner first-name, MERGE rather than append:
+            #     - keep the longer task description (more detail wins)
+            #     - preserve any due date from either side (existing
+            #       wins if both have one, since the earlier capture
+            #       was typically the explicit commitment)
+            owner_first = owner.split()[0].lower()
+
+            # Stage 1: exact match
+            if any(
+                (ex.get("owner") or "").split()[0].lower() == owner_first
+                and (ex.get("task") or "").lower() == task.lower()
                 for ex in existing
-            )
-            if not dup:
-                existing.append(item)
+            ):
+                continue
+
+            # Stage 2: fuzzy match against existing items from same owner.
+            # _task_similarity uses MAX of SequenceMatcher ratio and
+            # token-coverage ratio so it catches both "same words slightly
+            # rearranged" and "same key nouns, different framing verbs".
+            matched_idx = -1
+            for i, ex in enumerate(existing):
+                ex_owner_first = (ex.get("owner") or "").split()[0].lower()
+                if ex_owner_first != owner_first:
+                    continue
+                if _task_similarity(task, ex.get("task") or "") >= 0.6:
+                    matched_idx = i
+                    break
+
+            if matched_idx >= 0:
+                ex = existing[matched_idx]
+                # Prefer the more detailed task description.
+                if len(task) > len(ex.get("task") or ""):
+                    ex["task"] = task
+                # Fill in due date if the existing item didn't have one.
+                if not ex.get("due") and item.get("due"):
+                    ex["due"] = item["due"]
+                continue
+
+            existing.append({"owner": owner, "task": task, "due": item.get("due")})
 
     if turn.get("follow_up_meeting"):
         state["follow_up"] = turn["follow_up_meeting"]
+
+
+# ----------------------------------------------------------------------------
+# Raise-hand / pending intervention state machine
+# ----------------------------------------------------------------------------
+#
+# Rules 2 (off-topic redirect) and 3 (silent-participant nudge) use a
+# two-phase pattern: the bot first raises its hand with a short polite
+# "may I chime in?" line, then on a later turn — once a human
+# acknowledges it — actually delivers the redirect or nudge.
+#
+# state["pending_intervention"] tracks that "hand raised, waiting" state
+# between turns. None when nothing is pending. A dict otherwise:
+#   {"type": "off_topic" | "silent_nudge", "target": "<name or agenda>"}
+#
+# The functions below own all reads/writes to this state so the live
+# (run_moderator) and dry-run (run_dry) paths stay in lockstep.
+
+
+# Per-participant nudge grace: a late joiner shouldn't be nudged the
+# moment they arrive into a room that's already past 10 total turns.
+# Each participant gets their own 10-turn buffer measured from the
+# total-turn count at the moment they joined. SILENT_NUDGE_GRACE is
+# both the threshold (in update_pending_intervention) and the buffer
+# size (in this picker) - keeping it in one named constant means the
+# two stay in lockstep if we ever tune the value.
+SILENT_NUDGE_GRACE = 10
+
+
+def _silent_nudge_candidates(state: dict) -> List[str]:
+    """
+    Return the silent participants who are eligible to be nudged
+    RIGHT NOW: zero turns, not already nudged, AND at least
+    SILENT_NUDGE_GRACE turns have happened SINCE THEY JOINED.
+
+    Per-participant grace replaces the old global "total_turns >= 10"
+    gate. A late joiner walking into a room with 30 prior turns isn't
+    immediately nudge-eligible — they get the same 10-turn buffer the
+    original participants got from the meeting's start. joined_at_turn
+    captures the total-turn count at the moment each participant was
+    first seen (via participant.joined in the live path, /join in
+    dry-run, or implicit add via transcript.final).
+    """
+    nudged = state.get("nudged_set", set())
+    joined_at_turn = state.get("joined_at_turn") or {}
+    total_turns = sum(state.get("speaker_turns", {}).values())
+    candidates: List[str] = []
+    for name, count in state.get("speaker_turns", {}).items():
+        if count != 0 or name in nudged:
+            continue
+        # Default to 0 for participants seeded BEFORE joined_at_turn
+        # tracking existed (or any path that forgot to seed) — this
+        # matches the previous global-gate behaviour, so we never
+        # regress to "harder to nudge than before".
+        join_turn = joined_at_turn.get(name, 0)
+        if (total_turns - join_turn) >= SILENT_NUDGE_GRACE:
+            candidates.append(name)
+    return candidates
+
+
+def _pick_silent_nudge_target(state: dict) -> Optional[str]:
+    """
+    Identify the most likely silent participant the bot is about to
+    nudge. Used to populate pending_intervention["target"] when the
+    model emits intent="raise_hand" without telling us who.
+
+    Returns the FIRST nudge-eligible candidate (silent, not nudged,
+    grace period elapsed), else None.
+    """
+    candidates = _silent_nudge_candidates(state)
+    return candidates[0] if candidates else None
+
+
+def update_pending_intervention(state: dict, turn: dict) -> None:
+    """
+    Set or clear state["pending_intervention"] based on what the model
+    just emitted.
+
+      - intent="raise_hand" → set pending based on which rule's
+        conditions are currently met. Off-topic streak >= 8 takes
+        priority over silent-nudge if both happen to be true.
+      - intent in ("redirect", "nudge") → clear pending (delivered).
+      - intent in ("answer", "wrap_up", "open") → leave pending alone.
+      - intent is None (silent turn) → leave pending alone.
+    """
+    intent = turn.get("intent")
+    if intent == "raise_hand":
+        # GUARD A: if the bot's hand is ALREADY up, this is a model
+        # violation (SYSTEM_PROMPT explicitly says "do not raise again
+        # while pending"). Suppress so we don't accidentally toggle
+        # the Meet ✋ off via a duplicate meeting.raise_hand send.
+        if state.get("pending_intervention"):
+            turn["intent"] = None
+            return
+
+        # GUARD B: validate that one of the two real triggers actually
+        # holds. The model sometimes raises hand early (e.g. at
+        # off-topic streak=4 instead of 8). If neither rule's hard
+        # threshold is crossed, treat this as a misfire and suppress —
+        # bot stays silent, no Meet ✋ sent, no pending set. The
+        # threshold gets enforced server-side regardless of how the
+        # model's judgment drifts under prompt updates.
+        streak = state.get("off_topic_streak") or 0
+        # _pick_silent_nudge_target now enforces the per-participant
+        # grace internally (a candidate is only returned once they
+        # personally have >= SILENT_NUDGE_GRACE turns since joining),
+        # so we no longer need the old global "total_turns >= 10"
+        # gate here. If no candidate qualifies, the picker returns
+        # None and we fall through to the misfire-cancel branch below.
+        silent_target = _pick_silent_nudge_target(state)
+        if streak >= 8:
+            agenda_list = state.get("agenda") or []
+            agenda_str = ", ".join(agenda_list) if agenda_list else "the agenda"
+            state["pending_intervention"] = {
+                "type": "off_topic",
+                "target": agenda_str,
+            }
+        elif silent_target:
+            state["pending_intervention"] = {
+                "type": "silent_nudge",
+                "target": silent_target,
+            }
+        else:
+            # Misfire: model raised hand prematurely. Cancel.
+            turn["intent"] = None
+            return
+    elif intent == "redirect":
+        # Delivering the redirect clears pending AND resets the
+        # off-topic streak. The redirect has done its job; if the
+        # room drifts again afterwards, we want a fresh 8-turn
+        # buffer before raising hand a second time. Without this
+        # reset, the streak counter from the just-delivered drift
+        # carries forward and the second raise_hand would trigger
+        # almost immediately on the next off-topic utterance.
+        state["pending_intervention"] = None
+        state["off_topic_streak"] = 0
+        state["off_topic_last_speaker"] = None
+    elif intent == "nudge":
+        # Nudge clears pending. The off-topic streak is unrelated
+        # to silent-participant handling, so it's left alone.
+        state["pending_intervention"] = None
+
+
+# Minimal stopword set for action-item dedup. Kept short on purpose —
+# we strip these so the token-overlap similarity below focuses on
+# content words (nouns + verbs). NOT a full NLP stopword list; just
+# the connective tissue that shows up in commitment phrasing.
+_TASK_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for",
+    "with", "by", "from", "into", "at", "as",
+    "is", "are", "be", "been", "being", "was", "were", "have", "has",
+    "had", "will", "would", "should", "can", "could", "may", "might",
+    "i", "we", "you", "they", "he", "she", "it", "us", "our", "your",
+    "this", "that", "these", "those", "add", "own", "do",
+}
+
+
+def _normalize_task_tokens(task: str) -> set:
+    """
+    Tokenize a task description for similarity comparison.
+
+    Lowercases, strips punctuation, removes stopwords, and applies
+    crude stemming (-ing, trailing -s) so "benchmark" matches
+    "benchmarking" and "evals" matches "eval". Returns a set of
+    content tokens.
+    """
+    tokens: set = set()
+    for word in task.lower().split():
+        word = "".join(c for c in word if c.isalnum())
+        if not word or word in _TASK_STOPWORDS or len(word) <= 2:
+            continue
+        if word.endswith("ing") and len(word) > 5:
+            word = word[:-3]
+        elif word.endswith("s") and len(word) > 3:
+            word = word[:-1]
+        tokens.add(word)
+    return tokens
+
+
+def _task_similarity(task_a: str, task_b: str) -> float:
+    """
+    Similarity score for action-item dedup, in [0, 1].
+
+    Combines two signals via max:
+      - SequenceMatcher ratio (catches near-identical strings)
+      - Token-coverage ratio: shared_tokens / min(tokens_a, tokens_b)
+        (catches "same key nouns, different verbs" — e.g. "add safety
+        evals — refusal rates and tone consistency" vs "own the
+        safety eval plan", which share {safety, eval} = 2 out of
+        min(8, 3) = 0.67).
+
+    Using max means EITHER signal can trigger a merge. The cost is
+    occasional false positives when two genuinely distinct tasks share
+    a key noun (e.g. "review prompt templates" vs "migrate prompt
+    templates"). The prompt-level "Existing action items" guard
+    catches most of those before they reach this function.
+    """
+    seq = difflib.SequenceMatcher(None, task_a.lower(), task_b.lower()).ratio()
+    tokens_a = _normalize_task_tokens(task_a)
+    tokens_b = _normalize_task_tokens(task_b)
+    if not tokens_a or not tokens_b:
+        coverage = 0.0
+    else:
+        intersection = len(tokens_a & tokens_b)
+        coverage = intersection / min(len(tokens_a), len(tokens_b))
+    return max(seq, coverage)
+
+
+def _format_existing_action_items(action_items: List[dict]) -> str:
+    """
+    Format the cumulative action items captured so far for the per-turn
+    prompt. The model uses this to avoid re-capturing the same
+    commitment in slightly different wording on a later turn.
+
+    Grouped by owner first name, one bullet per task. Returns an empty
+    string when nothing is captured yet (no point spending tokens on
+    an empty list).
+    """
+    if not action_items:
+        return ""
+    grouped: "dict[str, List[str]]" = {}
+    for item in action_items:
+        owner = (item.get("owner") or "Unknown").split()[0]
+        task = (item.get("task") or "").strip()
+        if not task:
+            continue
+        grouped.setdefault(owner, []).append(task)
+    if not grouped:
+        return ""
+    lines = ["Existing action items captured so far (DO NOT re-capture these):"]
+    for owner, tasks in grouped.items():
+        for t in tasks:
+            lines.append(f"  - {owner}: {t}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_elapsed(started_at: datetime) -> str:
+    """
+    Format meeting-elapsed time for the per-turn prompt.
+
+    Used so the moderator can answer time-relative questions accurately
+    ("what did we discuss in the last 5 minutes?"). Each per-turn
+    prompt includes this string at the top, so the model's chat
+    history accumulates a timestamp for every utterance — letting it
+    infer silent gaps from consecutive deltas and bound "the last N
+    minutes" against the current elapsed value.
+
+    Output examples: "42s", "8m 17s", "1h 23m".
+    """
+    seconds = max(0, int((datetime.now() - started_at).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rem_s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {rem_s}s"
+    hours, rem_m = divmod(minutes, 60)
+    return f"{hours}h {rem_m}m"
+
+
+def _format_pending_for_prompt(pending: Optional[dict]) -> str:
+    """
+    Format state["pending_intervention"] for the per-turn prompt.
+
+    The bot reads this line and uses it to decide whether to deliver
+    (Phase 2b / 3b) or keep waiting. Wording is deliberately
+    instructional rather than just a value dump.
+    """
+    if not pending:
+        return "none (hand is down)"
+    ptype = pending.get("type")
+    target = pending.get("target") or "the agenda"
+    if ptype == "off_topic":
+        return (
+            f"off_topic — hand raised, waiting for acknowledgment. "
+            f"If current speaker acknowledges you, deliver an off-topic "
+            f"redirect to: {target}."
+        )
+    if ptype == "silent_nudge":
+        return (
+            f"silent_nudge for {target} — hand raised, waiting for "
+            f"acknowledgment. If current speaker acknowledges you, "
+            f"deliver a polite nudge inviting {target} to speak."
+        )
+    return "unknown (hand raised, unclear purpose — keep waiting)"
+
+
+def _format_state_diagnostics(state: dict, turn: dict) -> str:
+    """
+    One-line per-turn diagnostic string showing internal counters
+    the bot uses to decide whether to intervene. Mirrors the dry-run
+    [state] line so live testing exposes the same signals.
+
+    Empty pieces are omitted, so a quiet turn with no action items
+    and no off-topic still gets a useful counter readout.
+    """
+    parts: List[str] = []
+    speaker_turns = state.get("speaker_turns") or {}
+    if speaker_turns:
+        counts = " ".join(f"{n}={c}" for n, c in speaker_turns.items())
+        parts.append(f"turns({counts})")
+    silent = [n for n, c in speaker_turns.items() if c == 0]
+    if silent:
+        parts.append(f"silent({', '.join(silent)})")
+        # Show how many turns have happened since each silent person
+        # joined — this is the per-participant grace clock. Helps
+        # debug "why didn't the bot nudge X?" by surfacing whether
+        # X is still in their grace window. Format: "since_joined
+        # (Name=3/10)" meaning 3 of 10 turns elapsed since they
+        # joined. Once the numerator hits the denominator they're
+        # nudge-eligible (assuming they're not already nudged).
+        joined_at_turn = state.get("joined_at_turn") or {}
+        total_turns = sum(speaker_turns.values())
+        grace_parts = []
+        for name in silent:
+            join_turn = joined_at_turn.get(name, 0)
+            elapsed = total_turns - join_turn
+            grace_parts.append(f"{name}={elapsed}/{SILENT_NUDGE_GRACE}")
+        if grace_parts:
+            parts.append(f"since_joined({' '.join(grace_parts)})")
+    streak = state.get("off_topic_streak") or 0
+    parts.append(f"streak={streak}")
+    pending = state.get("pending_intervention")
+    if pending:
+        parts.append(f"pending={pending.get('type')}")
+    if turn.get("agenda_items"):
+        parts.append(f"agenda={turn['agenda_items']}")
+    if turn.get("new_action_items"):
+        parts.append(f"+{len(turn['new_action_items'])} action item(s)")
+    if turn.get("off_topic"):
+        parts.append("off_topic=true")
+    if turn.get("follow_up_meeting"):
+        parts.append("follow_up suggested")
+    return f"  [state] {' | '.join(parts)}"
+
+
+# ----------------------------------------------------------------------------
+# Owner normalization: map captured action-item owners to real participants
+# ----------------------------------------------------------------------------
+
+def _normalize_owner(captured: str, participants: List[str]) -> str:
+    """
+    Map a captured owner first-name (or full name) to the closest
+    matching real participant from the call.
+
+    STT is messy: Yaman gets transcribed as "Aman", Daniyal as
+    "Danielle", etc. The captured owner string also might come from
+    the model's interpretation of an "I"/"we" utterance and lack a
+    surname. This function picks the best match against the actual
+    participant list so the Slack post groups everyone correctly.
+
+    Strategy (in order):
+      1. No participants known → return captured unchanged.
+      2. Exact case-insensitive match on first name → return full
+         participant name.
+      3. difflib fuzzy match on first name (cutoff 0.7) → return
+         full participant name.
+      4. No match → return captured unchanged so it shows up clearly
+         in the Slack post and we know STT/model misfired.
+    """
+    if not captured or not participants:
+        return captured
+    captured_first = captured.strip().split()[0].lower() if captured.strip() else ""
+    if not captured_first:
+        return captured
+
+    first_to_full = {p.split()[0].lower(): p for p in participants}
+    if captured_first in first_to_full:
+        return first_to_full[captured_first]
+
+    matches = difflib.get_close_matches(
+        captured_first, list(first_to_full.keys()), n=1, cutoff=0.7
+    )
+    if matches:
+        return first_to_full[matches[0]]
+    return captured
+
+
+def normalize_action_item_owners(action_items: List[dict], participants: List[str]) -> List[dict]:
+    """
+    Return a new list of action items with every owner normalized to
+    a real call participant where possible. Items are NOT dropped if
+    a match isn't found - they keep their captured owner so the user
+    sees the STT/model failure rather than silently losing the item.
+
+    After normalization, duplicates (same normalized owner + same
+    task text, case-insensitive) are deduped because the rename can
+    collapse e.g. "Aman: do X" and "Yaman: do X" into the same item.
+    """
+    normalized: List[dict] = []
+    for item in action_items:
+        new_item = dict(item)
+        new_item["owner"] = _normalize_owner(item.get("owner", ""), participants)
+        # Dedup against what we've already emitted.
+        dup = any(
+            ex["owner"].lower() == new_item["owner"].lower()
+            and ex["task"].lower() == new_item["task"].lower()
+            for ex in normalized
+        )
+        if not dup:
+            normalized.append(new_item)
+    return normalized
 
 
 # ----------------------------------------------------------------------------
@@ -567,6 +1195,7 @@ def _format_transcript_for_extraction(transcript: List[dict]) -> str:
 
 
 _EMPTY_SUMMARY = {
+    "discussion_summary": "",
     "agenda": "",
     "outcome_met": "unknown",
     "outcome_note": "",
@@ -577,24 +1206,44 @@ _EMPTY_SUMMARY = {
 def _format_state_action_items_md(action_items: List[dict]) -> str:
     """
     Format the cumulative action items captured in state into Slack
-    mrkdwn. Preferred over the post-hoc Gemini extraction because the
-    items came directly from per-turn structured responses, so there's no
-    hallucination risk.
+    mrkdwn, grouped by owner. Preferred over the post-hoc Gemini
+    extraction because the items came directly from per-turn structured
+    responses, so there's no hallucination risk.
+
+    Output shape (one block per owner, separated by a blank line):
+
+        *Alice*
+        - pricing audit (due 2026-05-22)
+
+        *Bob*
+        - draft the launch comms (due 2026-05-27)
+        - coordinate with the customer advisory board
+
+    Owner ordering = first-mentioned-first (Python dict preserves
+    insertion order on 3.7+), which mirrors meeting flow.
 
     Slack mrkdwn: bold = *single asterisks*, NOT **double**.
     """
-    lines: List[str] = []
+    grouped: "dict[str, List[str]]" = {}
     for item in action_items:
         owner = item.get("owner") or "Unknown"
         task = item.get("task") or ""
         if not task:
             continue
         due = item.get("due")
-        if due:
-            lines.append(f"- *{owner}*: {task} (due {due})")
-        else:
-            lines.append(f"- *{owner}*: {task}")
-    return "\n".join(lines)
+        bullet = f"- {task} (due {due})" if due else f"- {task}"
+        grouped.setdefault(owner, []).append(bullet)
+
+    sections: List[str] = []
+    for owner, bullets in grouped.items():
+        sections.append(f"*{owner}*")
+        sections.extend(bullets)
+        sections.append("")  # blank line between owners
+
+    # Drop trailing blank so the section doesn't end with a stray newline.
+    while sections and not sections[-1]:
+        sections.pop()
+    return "\n".join(sections)
 
 
 def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None) -> dict:
@@ -632,11 +1281,13 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
     agenda_str = ", ".join(tracked_agenda) if tracked_agenda else ""
     action_items_md = _format_state_action_items_md(tracked_actions)
 
-    # outcome_met / outcome_note still need an LLM verdict - we can't
-    # derive "did we cover the agenda?" deterministically from state.
-    # Skip the call only if there's literally nothing to summarize.
+    # discussion_summary / outcome_met / outcome_note still need an LLM
+    # verdict - we can't derive "what was discussed" or "did we cover
+    # the agenda?" deterministically from state. Skip the call only if
+    # there's literally nothing to summarize.
     if not transcript:
         return {
+            "discussion_summary": "",
             "agenda": agenda_str,
             "outcome_met": "unknown",
             "outcome_note": "",
@@ -646,6 +1297,7 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
     body = _format_transcript_for_extraction(transcript)
     if not body:
         return {
+            "discussion_summary": "",
             "agenda": agenda_str,
             "outcome_met": "unknown",
             "outcome_note": "",
@@ -662,19 +1314,35 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
         )
     known_block = ("\n".join(known_facts) + "\n\n") if known_facts else ""
 
+    # Note: action_items_md is deliberately NOT requested here - state
+    # owns it deterministically and asking the LLM to regenerate the
+    # bullet list was the main cause of summary-call truncation at
+    # end-of-call.
+    #
+    # agenda IS requested here (overriding the terse state.agenda) -
+    # state.agenda is optimized for in-call off-topic detection
+    # (single phrase like "planning the migration") and reads vaguely
+    # in the Slack post. The LLM has the whole transcript and can write
+    # a more specific 1-2 sentence agenda that's actually useful to a
+    # reader who didn't attend.
     prompt = (
         "Below is the transcript of a meeting that just ended. Respond with "
         "a single JSON object containing EXACTLY these keys (no extras):\n"
-        " - agenda: a short (max 20 words) description of what the meeting "
-        "was about. Empty string if no clear agenda was discussed.\n"
+        " - agenda: a 1-2 sentence description (max 40 words) of what the "
+        "meeting was about. Be SPECIFIC - mention the concrete subject "
+        "(e.g. the system, project, or decision under discussion), not "
+        "just the verb (\"planning X\"). A reader who didn't attend should "
+        "understand the goal. Empty string only if no clear agenda was "
+        "discussed.\n"
+        " - discussion_summary: a 3-4 sentence narrative summary of what "
+        "was actually discussed. Cover the main topics, key decisions or "
+        "commitments, and any notable tangents or concerns. Write in past "
+        "tense (\"The team discussed...\"). Should be LONGER than the "
+        "agenda field.\n"
         " - outcome_met: one of \"yes\", \"no\", \"partial\", or \"unknown\" "
         "indicating whether the agenda was achieved.\n"
         " - outcome_note: a single sentence (max 25 words) justifying the "
-        "outcome_met verdict.\n"
-        " - action_items_md: a Slack-mrkdwn bullet list of action items, one "
-        "bullet per item in the EXACT format \"- *Owner*: task (due if "
-        "mentioned)\". Empty string if no action items. Use *single asterisks* "
-        "for bold, NOT **double**.\n\n"
+        "outcome_met verdict.\n\n"
         "Reply with ONLY the raw JSON object. No preamble, no closing "
         "remarks, no markdown code fences.\n\n"
         f"{known_block}"
@@ -700,6 +1368,7 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
         if not raw:
             print("  [summary extract error] Gemini returned empty response.")
             return {
+                "discussion_summary": "",
                 "agenda": agenda_str,
                 "outcome_met": "unknown",
                 "outcome_note": "",
@@ -710,6 +1379,7 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
         print(f"  [summary parse error] {exc}")
         print(f"  [summary raw output] {raw[:300]!r}{'...' if len(raw) > 300 else ''}")
         return {
+            "discussion_summary": "",
             "agenda": agenda_str,
             "outcome_met": "unknown",
             "outcome_note": "",
@@ -718,33 +1388,37 @@ def extract_meeting_summary(transcript: List[dict], state: Optional[dict] = None
     except Exception as exc:
         print(f"  [summary extract error] {exc}")
         return {
+            "discussion_summary": "",
             "agenda": agenda_str,
             "outcome_met": "unknown",
             "outcome_note": "",
             "action_items_md": action_items_md,
         }
 
-    # Prefer state-derived fields when we have them - they're more
-    # trustworthy than re-extracted text.
-    agenda_out = agenda_str or str(data.get("agenda", "")).strip()
-    action_items_out = action_items_md or str(data.get("action_items_md", "")).strip()
+    # Agenda preference REVERSED vs earlier: LLM-derived wins now.
+    # state.agenda is captured per-turn for in-call off-topic detection
+    # and tends to be a single terse phrase ("planning the migration");
+    # the LLM has the whole transcript and the dedicated "1-2 sentence,
+    # be specific" prompt and produces something more useful for a
+    # Slack reader who didn't attend. We still fall back to state's
+    # version if the LLM returned an empty string.
+    llm_agenda = str(data.get("agenda", "")).strip()
+    agenda_out = llm_agenda or agenda_str
 
     return {
+        "discussion_summary": str(data.get("discussion_summary", "")).strip(),
         "agenda": agenda_out,
         "outcome_met": str(data.get("outcome_met", "unknown")).strip().lower(),
         "outcome_note": str(data.get("outcome_note", "")).strip(),
-        "action_items_md": action_items_out,
+        "action_items_md": action_items_md,
     }
 
 
 def build_slack_summary(
-    call_id: str,
     started_at: datetime,
     ended_at: datetime,
-    bot_name: str,
-    voice: str,
-    end_reason: str,
     summary: dict,
+    participants: Optional[List[str]] = None,
     dry_run: bool = False,
 ) -> str:
     """
@@ -759,10 +1433,19 @@ def build_slack_summary(
 
     Sections (in order, conditionally shown):
       header (title)
-      Call ID / Duration / Bot / End reason
-      Agenda           (omitted if empty)
-      Action items     (always shown - "no items" placeholder if empty)
+      Duration         (always)
+      Participants     (omitted if list is empty)
+      Agenda           (omitted if empty — 1-2 sentence LLM-derived
+                        description; richer than the in-call state.agenda)
+      Summary          (omitted if empty — LLM-generated 3-4 sentence
+                        narrative recap; longer than Agenda)
+      Action items     (always shown - "no items" placeholder if empty,
+                        grouped per owner if present)
       Outcome reached  (omitted entirely if outcome is unknown AND no note)
+
+    Deliberately dropped (user preference, 2026-05-20): the Call ID,
+    Bot name+voice, and End reason lines. They were operational
+    breadcrumbs that didn't add value for the audience reading the post.
     """
     duration_sec = max(0.0, (ended_at - started_at).total_seconds())
     if duration_sec < 60:
@@ -778,16 +1461,22 @@ def build_slack_summary(
     lines: List[str] = [
         f"*{title_prefix}Meeting Summary — {date_str}*",
         "",
-        f"*Call ID:* {call_id}",
         f"*Duration:* {duration_str} ({start_hm} – {end_hm} local)",
-        f"*Bot:* {bot_name} (voice: {voice})",
-        f"*End reason:* {end_reason}",
-        "",
     ]
+    if participants:
+        lines.append(f"*Participants:* {', '.join(participants)}")
+    lines.append("")
 
     agenda = summary.get("agenda", "").strip()
     if agenda:
-        lines.append(f"*Agenda:* {agenda}")
+        lines.append("*Agenda*")
+        lines.append(agenda)
+        lines.append("")
+
+    discussion_summary = summary.get("discussion_summary", "").strip()
+    if discussion_summary:
+        lines.append("*Summary*")
+        lines.append(discussion_summary)
         lines.append("")
 
     lines.append("*Action items*")
@@ -891,6 +1580,12 @@ async def run_moderator(
     state.setdefault("agenda", [])
     action_items: List[dict] = state.setdefault("action_items", [])
     speaker_turns: dict = state.setdefault("speaker_turns", {})
+    # joined_at_turn[name] = total turns in the room when that
+    # participant first appeared. Used by _silent_nudge_candidates
+    # to give late joiners their own 10-turn grace period instead
+    # of nudging them the instant they walk into a room already
+    # past the global threshold.
+    joined_at_turn: dict = state.setdefault("joined_at_turn", {})
     # off_topic_streak tracks consecutive off-topic turns from the
     # SAME speaker. Resets on a topical turn or a speaker change. This
     # is what gates the redirect intervention (rule 2 in SYSTEM_PROMPT).
@@ -901,6 +1596,11 @@ async def run_moderator(
     # to avoid badgering people.
     state.setdefault("nudged_set", set())
     state.setdefault("follow_up", None)
+    # Raise-hand bookkeeping. None when the bot's hand is down; a dict
+    # {"type": "off_topic"|"silent_nudge", "target": "<name or agenda>"}
+    # when it has raised its hand and is waiting for someone to
+    # acknowledge before delivering.
+    state.setdefault("pending_intervention", None)
 
     # `is_speaking` defends against the bot's own TTS audio bleeding back
     # into STT. In direct mode, the bot's voice is injected into the Meet's
@@ -955,6 +1655,16 @@ async def run_moderator(
                     # re-join (network blip) doesn't clobber an existing
                     # turn count.
                     speaker_turns.setdefault(name, 0)
+                    # Capture the total-turn count at the moment they
+                    # joined so _silent_nudge_candidates can apply a
+                    # per-participant grace period (they don't get
+                    # nudged until SILENT_NUDGE_GRACE turns have
+                    # happened SINCE they walked in). setdefault keeps
+                    # the original join-point if a network blip causes
+                    # a duplicate participant.joined.
+                    joined_at_turn.setdefault(
+                        name, sum(speaker_turns.values())
+                    )
                     if not greeted:
                         # First human in - ask Gemini to open the meeting via
                         # the moderator-structured path. SYSTEM_PROMPT's rule
@@ -997,9 +1707,14 @@ async def run_moderator(
                     # Remove from speaker_turns so the bot doesn't try to
                     # nudge someone who's no longer in the room. The nudged_set
                     # is small and harmless to leave alone (it just records
-                    # historical nudges).
+                    # historical nudges). Also drop their joined_at_turn
+                    # entry so if they re-join later they get a fresh
+                    # grace period starting at their re-join moment
+                    # (otherwise the original join-point would carry
+                    # over and they'd be immediately nudge-eligible).
                     if leaver != bot_name:
                         speaker_turns.pop(leaver, None)
+                        joined_at_turn.pop(leaver, None)
 
                 elif event_type == "tts.started":
                     is_speaking = True
@@ -1024,6 +1739,16 @@ async def run_moderator(
 
                     # Bump this speaker's turn count BEFORE asking the model
                     # so the per-turn prompt sees up-to-date numbers.
+                    # Defensive joined_at_turn seed for speakers we never
+                    # saw a participant.joined event for (event lost,
+                    # name mismatch, etc.). The grace value is moot for
+                    # someone actively speaking — they're not silent —
+                    # but the entry keeps state consistent and avoids a
+                    # later KeyError if they go silent again.
+                    if speaker not in speaker_turns:
+                        joined_at_turn.setdefault(
+                            speaker, sum(speaker_turns.values())
+                        )
                     speaker_turns[speaker] = speaker_turns.get(speaker, 0) + 1
 
                     # Build the per-turn context the moderator sees. The
@@ -1033,12 +1758,26 @@ async def run_moderator(
                     # already in the chat's rolling history).
                     agenda_now = state.get("agenda") or []
                     agenda_line = ", ".join(agenda_now) if agenda_now else "NOT YET SET"
+                    participants_line = ", ".join(sorted(speaker_turns.keys())) or "(none yet)"
                     turn_counts_line = ", ".join(
                         f"{n}={c}" for n, c in sorted(speaker_turns.items(), key=lambda kv: -kv[1])
                     ) or "(none yet)"
                     total_turns = sum(speaker_turns.values())
                     silent_list = [n for n, c in speaker_turns.items() if c == 0]
                     silent_line = ", ".join(sorted(silent_list)) or "(none)"
+                    # Show ONLY the silent participants whose per-
+                    # participant grace has elapsed. The system prompt
+                    # rule 3 instructs the model to nudge from THIS
+                    # list, not the broader "Silent participants" line.
+                    # Without this, the model would try to raise hand
+                    # for a late joiner the moment the global turn
+                    # count crossed 10 — our state-machine guard
+                    # would reject it, but the call costs tokens.
+                    eligible_nudge_list = _silent_nudge_candidates(state)
+                    eligible_nudge_line = (
+                        ", ".join(sorted(eligible_nudge_list))
+                        or "(none — either no one silent, all in grace, or all already nudged)"
+                    )
                     streak_line = (
                         f"{state['off_topic_streak']} consecutive off-topic turn(s) by "
                         f"{state['off_topic_last_speaker']}"
@@ -1046,6 +1785,14 @@ async def run_moderator(
                         else "0 (no current streak)"
                     )
                     nudged_line = ", ".join(sorted(state["nudged_set"])) or "(none yet)"
+                    pending_line = _format_pending_for_prompt(state.get("pending_intervention"))
+                    # Show the model what's already captured so it
+                    # doesn't restate the same commitment with slightly
+                    # different wording. Empty string when nothing is
+                    # captured yet — keeps the prompt compact early on.
+                    existing_items_block = _format_existing_action_items(
+                        state.get("action_items") or []
+                    )
 
                     prompt = (
                         # Today's date is the anchor for resolving any
@@ -1054,12 +1801,23 @@ async def run_moderator(
                         # it, Gemini defaults to a year near its training
                         # cutoff (e.g. 2024) instead of the current year.
                         f"Today's date: {datetime.now():%Y-%m-%d (%A)}\n"
+                        # Meeting-elapsed time lets the model answer
+                        # time-relative recap questions accurately. Each
+                        # per-turn prompt accumulates a timestamp in the
+                        # chat history, so the model can infer silent
+                        # gaps from consecutive deltas and bound "the
+                        # last 5 minutes" against current elapsed.
+                        f"Meeting elapsed: {_format_elapsed(state['started_at'])}\n"
                         f"Agenda: {agenda_line}\n"
+                        f"Participants in this call: {participants_line}\n"
                         f"Speaker turn counts so far: {turn_counts_line}\n"
                         f"Total participant turns: {total_turns}\n"
                         f"Silent participants (0 turns): {silent_line}\n"
+                        f"Silent participants eligible for nudge: {eligible_nudge_line}\n"
                         f"Off-topic streak: {streak_line}\n"
                         f"Already nudged (do NOT re-nudge): {nudged_line}\n"
+                        f"Pending intervention: {pending_line}\n"
+                        + existing_items_block +
                         f"Current speaker: {speaker}\n"
                         f"They just said: {text}"
                     )
@@ -1086,6 +1844,27 @@ async def run_moderator(
                     # Merge agenda / action items / follow-up suggestions.
                     merge_turn_into_state(state, turn)
 
+                    # Set / clear the raise-hand pending state based on
+                    # which intent the model just emitted. Must happen
+                    # AFTER merge so streak/silent counters are current.
+                    update_pending_intervention(state, turn)
+
+                    # Per-turn state diagnostics — mirror of run_dry's
+                    # [state] line so live testing shows the same
+                    # bot-internal counters. Useful for debugging "why
+                    # did it (not) intervene" in real meetings.
+                    print(_format_state_diagnostics(state, turn))
+
+                    # Raise-hand branch: native Meet ✋ reaction, no TTS.
+                    # ask_moderator_structured guarantees speak is None
+                    # when intent == "raise_hand", so we route this
+                    # branch BEFORE the "no speak -> silent" early-out.
+                    if turn.get("intent") == "raise_hand":
+                        await ws.send(json.dumps({"type": "meeting.raise_hand"}))
+                        print("  [bot:raise_hand] ✋ (hand raised in Meet, no TTS)")
+                        transcript.append({"role": "moderator", "text": "✋ [hand raised]"})
+                        continue
+
                     # Speak only if the model decided to. Most turns this is
                     # None and we stay silent - exactly the behavior change
                     # Block 2 is shipping for.
@@ -1098,16 +1877,32 @@ async def run_moderator(
                     # We use a heuristic: any participant who's been
                     # mentioned by name in the speak text and currently has
                     # turn-count <= 1 was probably the target of the nudge.
-                    for participant_name in list(speaker_turns.keys()):
-                        first_name = participant_name.split()[0]
-                        if (
-                            speaker_turns.get(participant_name, 0) <= 1
-                            and first_name.lower() in turn["speak"].lower()
-                        ):
-                            state["nudged_set"].add(participant_name)
+                    # (Only fires on intent="nudge" — raise_hand has no
+                    # speak text to name anyone in.)
+                    if turn.get("intent") == "nudge":
+                        for participant_name in list(speaker_turns.keys()):
+                            first_name = participant_name.split()[0]
+                            if (
+                                speaker_turns.get(participant_name, 0) <= 1
+                                and first_name.lower() in turn["speak"].lower()
+                            ):
+                                state["nudged_set"].add(participant_name)
 
-                    print(f"  [bot] {turn['speak']}")
+                    intent_tag = turn.get("intent") or "speak"
+                    print(f"  [bot:{intent_tag}] {turn['speak']}")
                     transcript.append({"role": "moderator", "text": turn["speak"]})
+
+                    # Try to lower the hand BEFORE speaking when this turn
+                    # is delivering a deferred intervention. AgentCall's
+                    # API doesn't expose meeting.lower_hand, but Meet's
+                    # underlying behavior tends to toggle on a second
+                    # meeting.raise_hand. Worst case (no toggle): this is
+                    # a no-op and the hand stays up. Best case: the hand
+                    # drops as the bot starts talking, mirroring a real
+                    # acknowledged-and-speaking handoff.
+                    if turn.get("intent") in ("redirect", "nudge"):
+                        await ws.send(json.dumps({"type": "meeting.raise_hand"}))
+
                     await ws.send(json.dumps({
                         "type": "tts.speak",
                         "text": turn["speak"],
@@ -1179,6 +1974,18 @@ def finalize_call(
     bot_name = state.get("bot_name", "Moderator")
     voice = state.get("voice", "unknown")
 
+    # Normalize captured action-item owners against the real participant
+    # list before anything else looks at state["action_items"]. STT
+    # mishears names ("Aman" instead of "Yaman") and the model's
+    # speaker-inference can also produce phantom names; this step
+    # collapses them onto actual people in the call so the Slack post
+    # never shows an unknown owner section.
+    participants = [p for p in state.get("speaker_turns", {}).keys() if p != bot_name]
+    if state.get("action_items") and participants:
+        state["action_items"] = normalize_action_item_owners(
+            state["action_items"], participants
+        )
+
     save_call_log(call_id, transcript, end_reason, output_file)
 
     if not slack_channel:
@@ -1190,8 +1997,8 @@ def finalize_call(
         # Still send a heads-up - it's useful to know a call started and
         # ended even if nothing was said.
         body = build_slack_summary(
-            call_id, started_at, ended_at, bot_name, voice, end_reason,
-            dict(_EMPTY_SUMMARY),
+            started_at, ended_at, dict(_EMPTY_SUMMARY),
+            participants=participants,
         )
         post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
         return
@@ -1203,7 +2010,7 @@ def finalize_call(
     # the moderator schema and can't dual-purpose for summary output.
     summary = extract_meeting_summary(transcript, state=state)
     body = build_slack_summary(
-        call_id, started_at, ended_at, bot_name, voice, end_reason, summary,
+        started_at, ended_at, summary, participants=participants,
     )
     post_action_items(SLACK_BOT_TOKEN, slack_channel, body)
 
@@ -1252,13 +2059,22 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
         "agenda": [],
         "action_items": [],
         "speaker_turns": {},
+        # See run_moderator for joined_at_turn semantics — same dict,
+        # populated by /join in this path.
+        "joined_at_turn": {},
         "off_topic_streak": 0,
         "off_topic_last_speaker": None,
         "nudged_set": set(),
         "follow_up": None,
+        "pending_intervention": None,
         "chat": chat,
     }
     started_at = datetime.now()
+    # Expose started_at through state so the per-turn prompt builder
+    # (which only sees `state`) can compute meeting-elapsed time for
+    # time-relative questions like "what did we discuss in the last
+    # 5 minutes?".
+    state["started_at"] = started_at
 
     # Opening turn: same agenda-soliciting prompt the live bot uses.
     opening_prompt = (
@@ -1300,6 +2116,14 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
                 joinee = user_text[len("/join "):].strip()
                 if joinee:
                     state["speaker_turns"].setdefault(joinee, 0)
+                    # Mirror the live participant.joined seed: capture
+                    # the total-turn count at join time so
+                    # _silent_nudge_candidates can give this person
+                    # their own SILENT_NUDGE_GRACE buffer instead of
+                    # nudging on the very next turn.
+                    state["joined_at_turn"].setdefault(
+                        joinee, sum(state["speaker_turns"].values())
+                    )
                     print(f"[state] +participant {joinee} (silent, 0 turns)\n")
                 else:
                     print("[dry-run] usage: /join <Name>\n")
@@ -1307,16 +2131,32 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
 
             speaker, text = _parse_speaker(user_text)
             transcript.append({"role": "participant", "speaker": speaker, "text": text})
+            # Defensive joined_at_turn seed for speakers who weren't
+            # explicitly /join'd before they spoke. See the matching
+            # block in run_moderator for full reasoning.
+            if speaker not in state["speaker_turns"]:
+                state["joined_at_turn"].setdefault(
+                    speaker, sum(state["speaker_turns"].values())
+                )
             state["speaker_turns"][speaker] = state["speaker_turns"].get(speaker, 0) + 1
 
             agenda_now = state.get("agenda") or []
             agenda_line = ", ".join(agenda_now) if agenda_now else "NOT YET SET"
+            participants_line = ", ".join(sorted(state["speaker_turns"].keys())) or "(none yet)"
             turn_counts_line = ", ".join(
                 f"{n}={c}" for n, c in sorted(state["speaker_turns"].items(), key=lambda kv: -kv[1])
             ) or "(none yet)"
             total_turns = sum(state["speaker_turns"].values())
             silent_list = [n for n, c in state["speaker_turns"].items() if c == 0]
             silent_line = ", ".join(sorted(silent_list)) or "(none)"
+            # See run_moderator for why we surface this separately —
+            # the model should nudge ONLY from the per-participant
+            # grace-filtered list, not the broader silent list.
+            eligible_nudge_list = _silent_nudge_candidates(state)
+            eligible_nudge_line = (
+                ", ".join(sorted(eligible_nudge_list))
+                or "(none — either no one silent, all in grace, or all already nudged)"
+            )
             streak_line = (
                 f"{state['off_topic_streak']} consecutive off-topic turn(s) by "
                 f"{state['off_topic_last_speaker']}"
@@ -1324,15 +2164,25 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
                 else "0 (no current streak)"
             )
             nudged_line = ", ".join(sorted(state["nudged_set"])) or "(none yet)"
+            pending_line = _format_pending_for_prompt(state.get("pending_intervention"))
+            existing_items_block = _format_existing_action_items(
+                state.get("action_items") or []
+            )
             prompt = (
-                # See live-path prompt for why we ship today's date.
+                # See live-path prompt for why we ship today's date and
+                # meeting-elapsed time.
                 f"Today's date: {datetime.now():%Y-%m-%d (%A)}\n"
+                f"Meeting elapsed: {_format_elapsed(state['started_at'])}\n"
                 f"Agenda: {agenda_line}\n"
+                f"Participants in this call: {participants_line}\n"
                 f"Speaker turn counts so far: {turn_counts_line}\n"
                 f"Total participant turns: {total_turns}\n"
                 f"Silent participants (0 turns): {silent_line}\n"
+                f"Silent participants eligible for nudge: {eligible_nudge_line}\n"
                 f"Off-topic streak: {streak_line}\n"
                 f"Already nudged (do NOT re-nudge): {nudged_line}\n"
+                f"Pending intervention: {pending_line}\n"
+                + existing_items_block +
                 f"Current speaker: {speaker}\n"
                 f"They just said: {text}"
             )
@@ -1350,24 +2200,39 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
 
             merge_turn_into_state(state, turn)
 
-            # Per-turn diagnostics so we can see what the bot decided.
-            decisions: List[str] = []
-            if turn["agenda_items"]:
-                decisions.append(f"agenda={turn['agenda_items']}")
-            if turn["new_action_items"]:
-                decisions.append(f"+{len(turn['new_action_items'])} action item(s)")
-            if turn["off_topic"]:
-                decisions.append("off_topic=true")
-            if turn["follow_up_meeting"]:
-                decisions.append("follow_up suggested")
-            if decisions:
-                print(f"[state] {' | '.join(decisions)}")
+            # Set / clear the raise-hand pending state based on intent.
+            update_pending_intervention(state, turn)
+
+            # If the model just nudged a silent participant, mark them
+            # as nudged. Only fires on intent="nudge" (the actual
+            # delivery phase) - intent="raise_hand" doesn't name anyone
+            # yet, so it'd be a false positive.
+            if turn.get("intent") == "nudge" and turn.get("speak"):
+                for participant_name in list(state["speaker_turns"].keys()):
+                    first_name = participant_name.split()[0]
+                    if (
+                        state["speaker_turns"].get(participant_name, 0) <= 1
+                        and first_name.lower() in turn["speak"].lower()
+                    ):
+                        state["nudged_set"].add(participant_name)
+
+            # Per-turn diagnostics - identical formatter the live path uses.
+            print(_format_state_diagnostics(state, turn).lstrip())
+
+            # Raise-hand: silent in dry-run since there's no Meet to
+            # send meeting.raise_hand to. Still surface it in the
+            # terminal so the user can see the bot took the action.
+            if turn.get("intent") == "raise_hand":
+                print("[bot:raise_hand] ✋ (would raise hand in Meet — silent)\n")
+                transcript.append({"role": "moderator", "text": "✋ [hand raised]"})
+                continue
 
             if not turn["speak"]:
                 print("[bot] (silent)\n")
                 continue
 
-            print(f"[bot] {turn['speak']}\n")
+            intent_tag = turn.get("intent") or "speak"
+            print(f"[bot:{intent_tag}] {turn['speak']}\n")
             transcript.append({"role": "moderator", "text": turn["speak"]})
     except KeyboardInterrupt:
         print()  # newline after ^C
@@ -1380,15 +2245,20 @@ def run_dry(bot_name: str, slack_channel: Optional[str] = None) -> None:
         elif not transcript:
             print("[dry-run] Nothing to post to Slack (empty session).")
         else:
+            # Normalize captured owners against the real (dry-run)
+            # participant list before formatting, same as the live
+            # finalize_call path.
+            participants = [p for p in state.get("speaker_turns", {}).keys() if p != bot_name]
+            if state.get("action_items") and participants:
+                state["action_items"] = normalize_action_item_owners(
+                    state["action_items"], participants
+                )
             summary = extract_meeting_summary(transcript, state=state)
             body = build_slack_summary(
-                call_id="dry-run",
                 started_at=started_at,
                 ended_at=datetime.now(),
-                bot_name=bot_name,
-                voice="(dry-run, no TTS)",
-                end_reason="dry-run",
                 summary=summary,
+                participants=participants,
                 dry_run=True,
             )
             post_action_items(SLACK_BOT_TOKEN, slack_channel, body)

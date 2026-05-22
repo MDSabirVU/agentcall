@@ -11,3 +11,6 @@ node_modules/
 # Local meeting-moderator artefacts and Claude Code state
 meeting-moderator-log-*.md
 .claude/
+
+# Block 4: real team email addresses, never commit
+examples/meeting-moderator-v2/team_roster.yaml

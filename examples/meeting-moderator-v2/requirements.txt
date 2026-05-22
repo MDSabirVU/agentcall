@@ -12,6 +12,13 @@
 requests>=2.31
 websockets>=12.0
 
+# Avatar mode (--avatar). Needs a local HTTP server + WS tunnel proxy so
+# AgentCall's headless browser can fetch our ui-templates/<name>/ HTML.
+# aiohttp is the same async HTTP toolkit the reference bridge
+# (scripts/python/bridge-visual.py) uses for this. Only required if you
+# pass --avatar; plain audio mode runs fine without it.
+aiohttp>=3.9
+
 # Gemini LLM (the unified SDK; do NOT install the deprecated google-generativeai)
 google-genai>=1.0
 
@@ -24,3 +31,7 @@ slack-sdk>=3.27
 # Block 3 — team roster YAML (Calendar integration; pulled in early so we don't
 # have to do a second pip install when Block 3 lands).
 PyYAML>=6.0
+
+# Block 4 — Atlassian / Jira integration. One SDK exposes both Jira() and
+# Confluence() classes; we only use Jira for now but the package is small.
+atlassian-python-api>=3.41
